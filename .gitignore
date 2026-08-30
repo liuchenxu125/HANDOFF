@@ -7,6 +7,10 @@ __pycache__
 wandb
 logs
 
+# Model artifacts (exported ONNX / checkpoints live under logs/ or deploy/ckpt)
+*.onnx
+*.pt
+
 # Editor / agent tooling
 .vscode
 .claude

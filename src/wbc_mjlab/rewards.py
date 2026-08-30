@@ -735,6 +735,191 @@ def ang_vel_xy(
   return torch.sum(torch.square(asset.data.root_link_ang_vel_b[:, :2]), dim=1)
 
 
+def dense_swing_height(
+  env: ManagerBasedRlEnv,
+  sensor_name: str,
+  height_sensor_name: str,
+  target_height: float,
+  command_name: str | None = None,
+  command_threshold: float = 0.05,
+) -> torch.Tensor:
+  """Penalize insufficient clearance only while a commanded foot is airborne."""
+  if target_height <= 0.0:
+    raise ValueError(f"target_height must be positive, got {target_height}")
+
+  contact_sensor: ContactSensor = env.scene[sensor_name]
+  assert contact_sensor.data.found is not None
+  height_sensor = env.scene[height_sensor_name]
+  assert isinstance(height_sensor, TerrainHeightSensor), (
+    "dense_swing_height requires a TerrainHeightSensor, "
+    f"got {type(height_sensor).__name__}"
+  )
+
+  foot_heights = height_sensor.data.heights
+  in_air = contact_sensor.data.found == 0
+  assert foot_heights.shape == in_air.shape, (
+    "dense_swing_height requires matching height/contact frames, "
+    f"got heights {tuple(foot_heights.shape)} and contacts {tuple(in_air.shape)}"
+  )
+
+  active = torch.ones(env.num_envs, device=env.device)
+  if command_name is not None:
+    command = env.command_manager.get_command(command_name)
+    if command is not None:
+      linear_norm = torch.norm(command[:, :2], dim=1)
+      angular_norm = torch.abs(command[:, 2])
+      active = (
+        linear_norm + angular_norm > command_threshold
+      ).float()
+
+  swing_mask = in_air.float() * active.unsqueeze(1)
+  normalized_deficit = torch.relu(target_height - foot_heights) / target_height
+  cost = torch.sum(torch.square(normalized_deficit) * swing_mask, dim=1)
+
+  num_swing_feet = torch.clamp(torch.sum(swing_mask), min=1.0)
+  env.extras["log"]["Metrics/swing_foot_height_mean"] = (
+    torch.sum(foot_heights * swing_mask) / num_swing_feet
+  )
+  env.extras["log"]["Metrics/swing_height_deficit_mean"] = (
+    torch.sum(normalized_deficit * swing_mask) / num_swing_feet
+  )
+  return cost
+
+
+class swing_height_curve:
+  """Track a half-sine foot-height curve over each contact-defined swing.
+
+  Each foot uses its contact sensor's ``current_air_time`` as swing progress,
+  so this term does not require an externally supplied gait phase.  The target
+  starts at zero at lift-off, reaches ``peak_height`` halfway through the
+  desired ``swing_time``, and returns to zero at the desired touchdown time.
+  Scalar targets are shared by all feet; tuples provide per-foot targets in
+  the same order as the contact and height sensor frames.
+  """
+
+  def __init__(self, cfg: RewardTermCfg, env: ManagerBasedRlEnv):
+    height_sensor = env.scene[cfg.params["height_sensor_name"]]
+    assert isinstance(height_sensor, TerrainHeightSensor), (
+      "swing_height_curve requires a TerrainHeightSensor, "
+      f"got {type(height_sensor).__name__}"
+    )
+    num_feet = height_sensor.num_frames
+
+    def _per_foot_target(
+      value: float | tuple[float, ...], name: str
+    ) -> torch.Tensor:
+      target = torch.as_tensor(value, device=env.device, dtype=torch.float32)
+      if target.ndim == 0:
+        target = target.repeat(num_feet)
+      else:
+        target = target.flatten()
+      if target.numel() != num_feet:
+        raise ValueError(
+          f"{name} must be a scalar or contain one value per foot "
+          f"({num_feet}), got {target.numel()}"
+        )
+      if bool(torch.any(target <= 0.0)):
+        raise ValueError(f"{name} values must all be positive, got {value}")
+      return target.unsqueeze(0)
+
+    self.peak_height = _per_foot_target(cfg.params["peak_height"], "peak_height")
+    self.swing_time = _per_foot_target(cfg.params["swing_time"], "swing_time")
+
+  def __call__(
+    self,
+    env: ManagerBasedRlEnv,
+    sensor_name: str,
+    height_sensor_name: str,
+    peak_height: float | tuple[float, ...],
+    swing_time: float | tuple[float, ...],
+    command_name: str | None = None,
+    command_threshold: float = 0.05,
+  ) -> torch.Tensor:
+    del peak_height, swing_time  # Precomputed once in ``__init__``.
+    contact_sensor: ContactSensor = env.scene[sensor_name]
+    assert contact_sensor.data.found is not None
+    assert contact_sensor.data.current_air_time is not None
+    height_sensor = env.scene[height_sensor_name]
+    assert isinstance(height_sensor, TerrainHeightSensor)
+
+    foot_heights = height_sensor.data.heights
+    current_air_time = contact_sensor.data.current_air_time
+    in_air = contact_sensor.data.found == 0
+    assert foot_heights.shape == current_air_time.shape == in_air.shape, (
+      "swing_height_curve requires matching height/contact frames, "
+      f"got heights {tuple(foot_heights.shape)}, air times "
+      f"{tuple(current_air_time.shape)}, and contacts {tuple(in_air.shape)}"
+    )
+
+    swing_progress = torch.clamp(
+      current_air_time / self.swing_time, min=0.0, max=1.0
+    )
+    desired_height = self.peak_height * torch.sin(torch.pi * swing_progress)
+
+    active = torch.ones(env.num_envs, device=env.device)
+    if command_name is not None:
+      command = env.command_manager.get_command(command_name)
+      if command is not None:
+        linear_norm = torch.norm(command[:, :2], dim=1)
+        angular_norm = torch.abs(command[:, 2])
+        active = (linear_norm + angular_norm > command_threshold).float()
+
+    swing_mask = in_air.float() * active.unsqueeze(1)
+    normalized_error = (foot_heights - desired_height) / self.peak_height
+    squared_error = torch.square(normalized_error) * swing_mask
+    cost = torch.sum(squared_error, dim=1)
+
+    num_swing_feet = torch.clamp(torch.sum(swing_mask), min=1.0)
+    env.extras["log"]["Metrics/swing_foot_height_mean"] = (
+      torch.sum(foot_heights * swing_mask) / num_swing_feet
+    )
+    env.extras["log"]["Metrics/swing_height_target_mean"] = (
+      torch.sum(desired_height * swing_mask) / num_swing_feet
+    )
+    env.extras["log"]["Metrics/swing_height_curve_rmse"] = torch.sqrt(
+      torch.sum(squared_error) / num_swing_feet
+    )
+    return cost
+
+
+def standing_foot_distance(
+  env: ManagerBasedRlEnv,
+  command_name: str,
+  command_threshold: float,
+  target_lateral_distance: float,
+  target_fore_distance: float,
+  asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+  """Penalize standing foot spacing measured in the robot root frame."""
+  asset = _get_robot(env, asset_cfg)
+  command = env.command_manager.get_command(command_name)
+  assert command is not None
+  linear_norm = torch.norm(command[:, :2], dim=1)
+  angular_norm = torch.abs(command[:, 2])
+  total_command = linear_norm + angular_norm
+  standing = (total_command < command_threshold).float()
+
+  foot_pos_w = asset.data.site_pos_w[:, asset_cfg.site_ids, :]
+  left_right_delta_w = foot_pos_w[:, 0] - foot_pos_w[:, 1]
+  left_right_delta_b = quat_apply_inverse(
+    asset.data.root_link_quat_w, left_right_delta_w
+  )
+  fore_distance = torch.abs(left_right_delta_b[:, 0])
+  lateral_distance = torch.abs(left_right_delta_b[:, 1])
+  fore_error = torch.square(fore_distance - target_fore_distance)
+  lateral_error = torch.square(lateral_distance - target_lateral_distance)
+  cost = (fore_error + lateral_error) * standing
+
+  denom = torch.clamp(torch.sum(standing), min=1)
+  env.extras["log"]["Metrics/standing_foot_fore_error"] = (
+    torch.sum(torch.sqrt(fore_error) * standing) / denom
+  )
+  env.extras["log"]["Metrics/standing_foot_lateral_error"] = (
+    torch.sum(torch.sqrt(lateral_error) * standing) / denom
+  )
+  return cost
+
+
 def stand_pose(
   env: ManagerBasedRlEnv,
   command_name: str = "twist",
@@ -831,16 +1016,27 @@ def feet_distance_lateral(
   min_distance: float,
   max_distance: float,
 ) -> torch.Tensor:
+  """Reward zero inside a lateral foot-spacing band and negative outside it.
+
+  The two feet may be selected by either body names (the original G1 usage)
+  or site names.  Site positions are preferable for Casbot02 because its
+  ``left_foot``/``right_foot`` sites lie at the collision-sole centers.
+  """
   asset = _get_robot(env, asset_cfg)
-  root_pos = asset.data.root_link_pos_w
   root_quat = asset.data.root_link_quat_w
-  foot_pos = asset.data.body_link_pos_w[:, asset_cfg.body_ids, :]
-  delta = foot_pos - root_pos.unsqueeze(1)
-  foot_pos_b = quat_apply_inverse(
-    root_quat.unsqueeze(1).expand(-1, len(asset_cfg.body_ids), -1).reshape(-1, 4),
-    delta.reshape(-1, 3),
-  ).reshape(env.num_envs, len(asset_cfg.body_ids), 3)
-  lateral = torch.abs(foot_pos_b[:, 0, 1] - foot_pos_b[:, 1, 1])
+  if asset_cfg.site_names is not None:
+    foot_pos_w = asset.data.site_pos_w[:, asset_cfg.site_ids, :]
+  else:
+    foot_pos_w = asset.data.body_link_pos_w[:, asset_cfg.body_ids, :]
+  if foot_pos_w.shape[1] != 2:
+    raise ValueError(
+      "feet_distance_lateral requires exactly two foot bodies or sites, "
+      f"got {foot_pos_w.shape[1]}"
+    )
+
+  left_right_delta_w = foot_pos_w[:, 0] - foot_pos_w[:, 1]
+  left_right_delta_b = quat_apply_inverse(root_quat, left_right_delta_w)
+  lateral = torch.abs(left_right_delta_b[:, 1])
   too_close = torch.clamp(lateral - min_distance, max=0.0)
   too_far = torch.clamp(-lateral + max_distance, max=0.0)
   return too_close + too_far
@@ -1135,12 +1331,6 @@ def motion_soft_landing(
 # ---------------------------------------------------------------------------
 # CBF reward (additive — attached only in the CBF task variant)
 # ---------------------------------------------------------------------------
-
-
-
-
-
-
 
 
 

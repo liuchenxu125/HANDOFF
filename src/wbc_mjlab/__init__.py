@@ -28,6 +28,19 @@ from wbc_mjlab.rl_cfg import unitree_g1_pkl_tracking_custom_ppo_runner_cfg
 from wbc_mjlab.rl_cfg import unitree_g1_loco_teacher_flat_nobv_runner_cfg
 from wbc_mjlab.rl_cfg import unitree_g1_hand_moe_flat_unicmd_nobv_amp_runner_cfg
 from wbc_mjlab.g1_constants_custom import attach_payloads_to_scene_robot
+from mjlab.rl.runner import MjlabOnPolicyRunner
+from wbc_mjlab.casbot02_config import (
+  casbot02_loco_teacher_env_cfg,
+  casbot02_student_env_cfg,
+)
+from wbc_mjlab.casbot02_rl_cfg import (
+  casbot02_loco_teacher_runner_cfg,
+  casbot02_student_runner_cfg,
+)
+from wbc_mjlab.casbot02ampj import (
+  casbot02_ampj_teacher_flat_env_cfg,
+  casbot02_ampj_teacher_flat_runner_cfg,
+)
 
 
 def _build_env_cfg_with_payloads(env_fn, *, play: bool):
@@ -71,5 +84,37 @@ register_mjlab_task(
     unitree_g1_amp_teacher_flat_env_cfg, play=True
   ),
   rl_cfg=unitree_g1_amp_teacher_flat_runner_cfg(),
+  runner_cls=AmpOnPolicyRunner,
+)
+
+
+# Casbot02 12-leg tasks: loco teacher (plain PPO) + distill student. These use
+# the plain Casbot02 robot (no G1 payloads), so register without the payload
+# wrapper. The student's teacher checkpoints are pinned via CLI, e.g.
+#   --agent.loco-teacher-checkpoint <path> --agent.amp-teacher-checkpoint <path>
+register_mjlab_task(
+  task_id="Casbot02-Loco-Teacher-Flat",
+  env_cfg=casbot02_loco_teacher_env_cfg(play=False),
+  play_env_cfg=casbot02_loco_teacher_env_cfg(play=True),
+  rl_cfg=casbot02_loco_teacher_runner_cfg(),
+  runner_cls=MjlabOnPolicyRunner,
+)
+
+register_mjlab_task(
+  task_id="Casbot02-Distill-Student-Flat",
+  env_cfg=casbot02_student_env_cfg(play=False),
+  play_env_cfg=casbot02_student_env_cfg(play=True),
+  rl_cfg=casbot02_student_runner_cfg(),
+  runner_cls=MjlabOnPolicyRunner,
+)
+
+
+# Independent 27-DoF CASBOT02 AMP recovery teacher.  Its robot and env config
+# live under ``casbot02ampj`` and do not inherit or mutate the G1 task.
+register_mjlab_task(
+  task_id="Casbot02-AMPJ-Teacher-Flat",
+  env_cfg=casbot02_ampj_teacher_flat_env_cfg(play=False),
+  play_env_cfg=casbot02_ampj_teacher_flat_env_cfg(play=True),
+  rl_cfg=casbot02_ampj_teacher_flat_runner_cfg(),
   runner_cls=AmpOnPolicyRunner,
 )
