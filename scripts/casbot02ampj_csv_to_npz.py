@@ -1,10 +1,11 @@
 """Convert CASBOT02 recovery CSV files to CASBOT02AMPJ AMP NPZ files.
 
-Expected CSV layout (36 columns):
+Accepted CSV layouts:
 
 * base position: 3 columns
 * base quaternion in xyzw order: 4 columns
-* joint position in the source 29-joint XML order: 29 columns
+* either the source 29-joint XML order (36 columns total), or the direct
+  CASBOT02AMPJ 27-joint order (34 columns total)
 
 The source joint vector contains head yaw/pitch.  Those two columns are
 discarded because the CASBOT02AMPJ recovery model fixes the head, yielding the
@@ -45,7 +46,7 @@ DEFAULT_RECOVERY_DIR = (
   / "Recovery"
 )
 
-INPUT_COLUMNS = 36
+INPUT_COLUMNS = (34, 36)
 INPUT_JOINT_COUNT = 29
 INPUT_FPS = 30.0
 OUTPUT_FPS = 50.0
@@ -114,10 +115,11 @@ def _quat_slerp_batch(
 
 def _load_csv(path: Path) -> np.ndarray:
   motion = np.loadtxt(path, delimiter=",", ndmin=2)
-  if motion.shape[1] != INPUT_COLUMNS:
+  if motion.shape[1] not in INPUT_COLUMNS:
     joint_columns = motion.shape[1] - 7
     raise ValueError(
-      f"{path}: expected 36 columns (3 position + 4 quaternion + 29 joints), "
+      f"{path}: expected 34 or 36 columns (3 position + 4 quaternion + "
+      f"27 or 29 joints), "
       f"got {motion.shape[1]} columns ({joint_columns} joint columns)"
     )
   if motion.shape[0] < 2:
@@ -136,6 +138,7 @@ class Casbot02AmpjCsvMotion:
     input_fps: float,
     output_fps: float,
     device: torch.device | str,
+    require_recovery_coverage: bool = True,
   ) -> None:
     if input_fps <= 0.0 or output_fps <= 0.0:
       raise ValueError("input_fps and output_fps must be positive")
@@ -163,19 +166,24 @@ class Casbot02AmpjCsvMotion:
     source_joint_pos = torch.as_tensor(
       raw[:, 7:], dtype=torch.float32, device=device
     )
-    if source_joint_pos.shape[1] != INPUT_JOINT_COUNT:
-      raise ValueError(
-        f"Expected {INPUT_JOINT_COUNT} source joints, got {source_joint_pos.shape[1]}"
+    if source_joint_pos.shape[1] == len(C.JOINT_NAMES):
+      print("  [dimension] direct CASBOT02AMPJ target joints=27 (head fixed)")
+      joint_pos_input = source_joint_pos
+    elif source_joint_pos.shape[1] == INPUT_JOINT_COUNT:
+      head_indices = tuple(
+        SOURCE_JOINT_NAMES.index(name) for name in C.HEAD_JOINT_NAMES
       )
-    head_indices = tuple(
-      SOURCE_JOINT_NAMES.index(name) for name in C.HEAD_JOINT_NAMES
-    )
-    head_max = float(torch.abs(source_joint_pos[:, head_indices]).max().item())
-    print(
-      f"  [dimension] CSV joints=29; remove head yaw/pitch -> target joints=27; "
-      f"head max |q|={head_max:.6f} rad"
-    )
-    joint_pos_input = source_joint_pos[:, TARGET_SOURCE_INDICES]
+      head_max = float(torch.abs(source_joint_pos[:, head_indices]).max().item())
+      print(
+        f"  [dimension] CSV joints=29; remove head yaw/pitch -> target joints=27; "
+        f"head max |q|={head_max:.6f} rad"
+      )
+      joint_pos_input = source_joint_pos[:, TARGET_SOURCE_INDICES]
+    else:
+      raise ValueError(
+        f"Expected 27 or {INPUT_JOINT_COUNT} source joints, "
+        f"got {source_joint_pos.shape[1]}"
+      )
 
     times = torch.arange(
       0.0,
@@ -216,7 +224,7 @@ class Casbot02AmpjCsvMotion:
       f"  [frames] {self.input_frames} @ {input_fps:g} Hz -> "
       f"{self.num_frames} @ {output_fps:g} Hz; duration={self.duration:.3f}s"
     )
-    self._report_recovery_coverage()
+    self._report_recovery_coverage(require=require_recovery_coverage)
 
   @staticmethod
   def _lerp(
@@ -245,7 +253,7 @@ class Casbot02AmpjCsvMotion:
         self.joint_pos, spacing=self.output_dt, dim=0
       )[0]
 
-  def _report_recovery_coverage(self) -> None:
+  def _report_recovery_coverage(self, *, require: bool) -> None:
     w, x, y, z = self.root_quat.unbind(dim=-1)
     roll = torch.atan2(
       2.0 * (w * x + y * z), 1.0 - 2.0 * (x * x + y * y)
@@ -267,7 +275,7 @@ class Casbot02AmpjCsvMotion:
       f"root z=[{float(root_z.min().item()):.3f}, "
       f"{float(root_z.max().item()):.3f}] m"
     )
-    if num_fallen == 0 or num_upright == 0:
+    if require and (num_fallen == 0 or num_upright == 0):
       raise ValueError(
         "Recovery clip must contain both fallen (z<0.45, tilt>1.0) and "
         "upright (z>0.70, tilt<0.3) frames"
@@ -283,6 +291,7 @@ def convert_file(
   output_fps: float,
   overwrite: bool,
   clamp_joint_limits: bool,
+  require_recovery_coverage: bool = True,
 ) -> None:
   if output_path.exists() and not overwrite:
     print(f"[SKIP] {output_path} already exists (use --overwrite True)")
@@ -293,6 +302,7 @@ def convert_file(
     input_fps=input_fps,
     output_fps=output_fps,
     device=sim.device,
+    require_recovery_coverage=require_recovery_coverage,
   )
   robot: Entity = scene["robot"]
   if clamp_joint_limits:
@@ -385,6 +395,7 @@ def main(
   device: str = "cpu",
   overwrite: bool = False,
   clamp_joint_limits: bool = True,
+  require_recovery_coverage: bool = True,
 ) -> None:
   """Convert one recovery CSV or every CSV in the Recovery directory."""
   output_root = Path(output_dir).expanduser().resolve()
@@ -419,6 +430,7 @@ def main(
       output_fps=output_fps,
       overwrite=overwrite,
       clamp_joint_limits=clamp_joint_limits,
+      require_recovery_coverage=require_recovery_coverage,
     )
 
 

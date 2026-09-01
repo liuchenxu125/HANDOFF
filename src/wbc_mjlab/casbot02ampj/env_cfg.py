@@ -220,31 +220,10 @@ def _apply_flat_terrain(cfg: ManagerBasedRlEnvCfg, *, play: bool) -> None:
   if play:
     cfg.events.pop("push_robot", None)
     cfg.curriculum = {}
-
-
-def _apply_twist_ranges(cfg: ManagerBasedRlEnvCfg) -> None:
-  """Match the loco teacher's vx/wz curriculum and keep vy disabled."""
-  twist_cmd = cfg.commands["twist"]
-  assert isinstance(twist_cmd, UniformVelocityCommandCfg)
-  vx, vy, wz = (-1.0, 1.0), (0.0, 0.0), (-1.0, 1.0)
-  twist_cmd.ranges.lin_vel_x = vx
-  twist_cmd.ranges.lin_vel_y = vy
-  twist_cmd.ranges.ang_vel_z = wz
-
-  cfg.curriculum["command_vel"].params["velocity_stages"] = [
-    {
-      "step": 0,
-      "lin_vel_x": (vx[0] * 0.5, vx[1] * 0.5),
-      "lin_vel_y": vy,
-      "ang_vel_z": (wz[0] * 0.5, wz[1] * 0.5),
-    },
-    {
-      "step": 5000 * 24,
-      "lin_vel_x": vx,
-      "lin_vel_y": vy,
-      "ang_vel_z": wz,
-    },
-  ]
+    twist = cfg.commands["twist"]
+    assert isinstance(twist, UniformVelocityCommandCfg)
+    twist.ranges.lin_vel_x = (-0.5, 1.0)
+    twist.ranges.ang_vel_z = (-0.7, 0.7)
 
 
 def _replace_with_amp_rewards(cfg: ManagerBasedRlEnvCfg) -> None:
@@ -363,7 +342,6 @@ def casbot02_ampj_teacher_flat_env_cfg(
   """Build the independent 27-DoF CASBOT02 AMP recovery-teacher task."""
   cfg = make_velocity_env_cfg()
   _apply_robot(cfg)
-  _apply_twist_ranges(cfg)
   _apply_flat_terrain(cfg, play=play)
   cfg.observations = _build_amp_observations(play=play)
   _replace_with_amp_rewards(cfg)

@@ -198,7 +198,7 @@ def _apply_loco_rewards(cfg: ManagerBasedRlEnvCfg) -> None:
   cfg.rewards["foot_swing_height"].params["target_height"] = 0.12
   cfg.rewards["foot_slip"].weight = -0.1
   cfg.rewards["foot_slip"].params["asset_cfg"] = _feet_site_asset()
-  cfg.rewards["soft_landing"].weight = -4e-3
+  cfg.rewards["soft_landing"].weight = -5e-3
 
   # 保留密集 air_time 信号：从离地 0.05 s 起给分，到 AMP 的约
   # 0.60 s 摆动时间停止给分；高度曲线同时在目标时刻回到零。
@@ -257,19 +257,19 @@ def _apply_loco_rewards(cfg: ManagerBasedRlEnvCfg) -> None:
   # intentional: the reward function returns a negative error outside this band.
   cfg.rewards["feet_distance_lateral"] = RewardTermCfg(
     func=wbc_rewards.feet_distance_lateral,
-    weight=1.0,
+    weight=2.0,
     params={
       "asset_cfg": _feet_site_asset(),
-      "min_distance": 0.268,
+      "min_distance": 0.275,
       "max_distance": 0.35,
     },
   )
   cfg.rewards["knee_distance_lateral"] = RewardTermCfg(
     func=wbc_rewards.knee_distance_lateral,
-    weight=1.0,
+    weight=3.0,
     params={
       "asset_cfg": _knee_body_asset(),
-      "min_distance": 0.268,
+      "min_distance": 0.275,
       "max_distance": 0.35,
     },
   )

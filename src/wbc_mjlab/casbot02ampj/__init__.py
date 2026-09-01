@@ -6,8 +6,16 @@ from wbc_mjlab.casbot02ampj.env_cfg import (
 from wbc_mjlab.casbot02ampj.rl_cfg import (
   casbot02_ampj_teacher_flat_runner_cfg,
 )
+from wbc_mjlab.casbot02ampj.getup_env_cfg import (
+  casbot02_ampj_getup_teacher_flat_env_cfg,
+)
+from wbc_mjlab.casbot02ampj.getup_rl_cfg import (
+  casbot02_ampj_getup_teacher_flat_runner_cfg,
+)
 
 __all__ = [
+  "casbot02_ampj_getup_teacher_flat_env_cfg",
+  "casbot02_ampj_getup_teacher_flat_runner_cfg",
   "casbot02_ampj_teacher_flat_env_cfg",
   "casbot02_ampj_teacher_flat_runner_cfg",
 ]

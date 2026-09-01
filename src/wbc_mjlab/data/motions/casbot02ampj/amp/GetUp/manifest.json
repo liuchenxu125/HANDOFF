@@ -1,0 +1,17 @@
+{
+  "description": "LeggedLab G1 GET-UP clips with non-zero sampling weight, retargeted to CASBOT02AMPJ 27DoF.",
+  "source_fps": 30.0,
+  "target_fps": 50.0,
+  "clips": [
+    {"name": "fallAndGetUp1_subject1_1060_1150", "source": "fallAndGetUp1_subject1.bvh", "start": 1060, "end": 1150},
+    {"name": "fallAndGetUp1_subject1_1400_1480", "source": "fallAndGetUp1_subject1.bvh", "start": 1400, "end": 1480},
+    {"name": "fallAndGetUp1_subject1_2100_2200", "source": "fallAndGetUp1_subject1.bvh", "start": 2100, "end": 2200},
+    {"name": "fallAndGetUp1_subject5_2500_2600", "source": "fallAndGetUp1_subject5.bvh", "start": 2500, "end": 2600},
+    {"name": "fallAndGetUp2_subject2_850_1050", "source": "fallAndGetUp2_subject2.bvh", "start": 850, "end": 1050},
+    {"name": "fallAndGetUp2_subject3_900_1000", "source": "fallAndGetUp2_subject3.bvh", "start": 900, "end": 1000},
+    {"name": "fallAndGetUp3_subject1_530_600", "source": "fallAndGetUp3_subject1.bvh", "start": 530, "end": 600},
+    {"name": "fallAndGetUp3_subject1_650_700", "source": "fallAndGetUp3_subject1.bvh", "start": 650, "end": 700},
+    {"name": "fallAndGetUp3_subject1_1080_1180", "source": "fallAndGetUp3_subject1.bvh", "start": 1080, "end": 1180},
+    {"name": "fallAndGetUp3_subject1_1630_1690", "source": "fallAndGetUp3_subject1.bvh", "start": 1630, "end": 1690}
+  ]
+}
