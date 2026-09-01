@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+from typing import Any
 
 from mjlab.rl import (
   RslRlModelCfg,
@@ -33,8 +34,29 @@ def _mlp_critic() -> RslRlModelCfg:
   )
 
 
-def _ppo_algorithm(class_name: str = "rsl_rl.algorithms:PPO") -> RslRlPpoAlgorithmCfg:
-  return RslRlPpoAlgorithmCfg(
+@dataclass
+class Casbot02PpoAlgorithmCfg(RslRlPpoAlgorithmCfg):
+  """PPO config exposing RSL-RL's optional symmetry extension."""
+
+  symmetry_cfg: dict[str, Any] | None = None
+
+
+def _ppo_algorithm(
+  class_name: str = "rsl_rl.algorithms:PPO",
+  *,
+  use_loco_symmetry: bool = False,
+) -> Casbot02PpoAlgorithmCfg:
+  symmetry_cfg = None
+  if use_loco_symmetry:
+    symmetry_cfg = {
+      "data_augmentation_func": (
+        "wbc_mjlab.casbot02_symmetry:compute_symmetric_states"
+      ),
+      "use_data_augmentation": True,
+      "use_mirror_loss": True,
+      "mirror_loss_coeff": 0.1,
+    }
+  return Casbot02PpoAlgorithmCfg(
     class_name=class_name,
     num_learning_epochs=5,
     num_mini_batches=4,
@@ -48,6 +70,7 @@ def _ppo_algorithm(class_name: str = "rsl_rl.algorithms:PPO") -> RslRlPpoAlgorit
     value_loss_coef=1.0,
     use_clipped_value_loss=True,
     clip_param=0.2,
+    symmetry_cfg=symmetry_cfg,
   )
 
 
@@ -65,7 +88,7 @@ def casbot02_loco_teacher_runner_cfg() -> RslRlOnPolicyRunnerCfg:
     wandb_project="casbot02",
     actor=_mlp_actor(),
     critic=_mlp_critic(),
-    algorithm=_ppo_algorithm(),
+    algorithm=_ppo_algorithm(use_loco_symmetry=True),
   )
 
 

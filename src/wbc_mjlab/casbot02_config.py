@@ -38,6 +38,7 @@ from mjlab.utils.noise import UniformNoiseCfg as Unoise
 from wbc_mjlab import casbot02_constants as C
 from wbc_mjlab import rewards as wbc_rewards
 from wbc_mjlab.casbot02_actions import Casbot02LegWithArmSwingActionCfg
+from wbc_mjlab.casbot02_commands import Casbot02VelocityCommandCfg
 
 
 def _leg_asset() -> SceneEntityCfg:
@@ -181,31 +182,60 @@ def _apply_loco_rewards(cfg: ManagerBasedRlEnvCfg) -> None:
   # AMP 前进数据：左/右峰值 11.6/11.4 cm，摆动时间 0.55/0.59 s。
   cfg.rewards.pop("foot_clearance", None)
   cfg.rewards["swing_height_curve"] = RewardTermCfg(
-    func=wbc_rewards.swing_height_curve,
+    func=wbc_rewards.command_conditioned_swing_height_curve,
     weight=-3.0,
     params={
       "sensor_name": "feet_ground_contact",
       "height_sensor_name": "foot_height_scan",
-      "peak_height": (0.114, 0.114),
-      "swing_time": (0.59, 0.59),
+      # Straight walking retains the tuned forward-data curve.  The pure-turn
+      # curve comes from 原地左转/右转.npz: ~6.4-6.7 cm and ~0.40 s.
+      "translation_peak_height": (0.114, 0.114),
+      "turning_peak_height": (0.065, 0.065),
+      "translation_swing_time": (0.59, 0.59),
+      "turning_swing_time": (0.40, 0.40),
       "command_name": "twist",
       "command_threshold": 0.2,
+      "turning_linear_threshold": 0.2,
+      "turning_angular_threshold": 0.2,
     },
   )
 
-  # 落地时检查完整摆动周期的峰值高度，与上面的密集不足惩罚互补。
-  cfg.rewards["foot_swing_height"].weight = -0.25
-  cfg.rewards["foot_swing_height"].params["target_height"] = 0.12
+  # 落地峰值必须使用同一套运动模式门控，否则原始 0.12 m 目标仍会
+  # 在背后把原地转弯脚拉高。
+  cfg.rewards["foot_swing_height"] = RewardTermCfg(
+    func=wbc_rewards.command_conditioned_feet_swing_height,
+    weight=-0.25,
+    params={
+      "sensor_name": "feet_ground_contact",
+      "height_sensor_name": "foot_height_scan",
+      "translation_target_height": 0.12,
+      "turning_target_height": 0.07,
+      "command_name": "twist",
+      "command_threshold": 0.05,
+      "turning_linear_threshold": 0.2,
+      "turning_angular_threshold": 0.2,
+    },
+  )
   cfg.rewards["foot_slip"].weight = -0.1
   cfg.rewards["foot_slip"].params["asset_cfg"] = _feet_site_asset()
-  cfg.rewards["soft_landing"].weight = -5e-3
+  cfg.rewards["soft_landing"].weight = -4e-3
 
-  # 保留密集 air_time 信号：从离地 0.05 s 起给分，到 AMP 的约
-  # 0.60 s 摆动时间停止给分；高度曲线同时在目标时刻回到零。
-  cfg.rewards["air_time"].weight = 1.0
-  cfg.rewards["air_time"].params["threshold_min"] = 0.05
-  cfg.rewards["air_time"].params["threshold_max"] = 0.60
-  cfg.rewards["air_time"].params["command_threshold"] = 0.2
+  # 保留密集 air_time 信号：直行窗口保持 0.05~0.60 s，纯转弯缩短为
+  # 0.05~0.42 s；高度曲线分别在 0.59/0.40 s 回到零。
+  cfg.rewards["air_time"] = RewardTermCfg(
+    func=wbc_rewards.command_conditioned_feet_air_time,
+    weight=1.0,
+    params={
+      "sensor_name": "feet_ground_contact",
+      "threshold_min": 0.05,
+      "translation_threshold_max": 0.60,
+      "turning_threshold_max": 0.42,
+      "command_name": "twist",
+      "command_threshold": 0.2,
+      "turning_linear_threshold": 0.2,
+      "turning_angular_threshold": 0.2,
+    },
+  )
 
   # Per-robot wiring: root/torso bodies + leg joints.
   cfg.rewards["track_linear_velocity"].params["asset_cfg"] = _torso_asset()
@@ -257,10 +287,10 @@ def _apply_loco_rewards(cfg: ManagerBasedRlEnvCfg) -> None:
   # intentional: the reward function returns a negative error outside this band.
   cfg.rewards["feet_distance_lateral"] = RewardTermCfg(
     func=wbc_rewards.feet_distance_lateral,
-    weight=2.0,
+    weight=3.0,
     params={
       "asset_cfg": _feet_site_asset(),
-      "min_distance": 0.275,
+      "min_distance": 0.27,
       "max_distance": 0.35,
     },
   )
@@ -269,7 +299,7 @@ def _apply_loco_rewards(cfg: ManagerBasedRlEnvCfg) -> None:
     weight=3.0,
     params={
       "asset_cfg": _knee_body_asset(),
-      "min_distance": 0.275,
+      "min_distance": 0.27,
       "max_distance": 0.35,
     },
   )
@@ -367,13 +397,32 @@ def _apply_casbot02_dr(cfg: ManagerBasedRlEnvCfg) -> None:
 
 
 def _apply_twist_ranges(cfg: ManagerBasedRlEnvCfg) -> None:
-  """G1-aligned vx/wz curriculum with lateral velocity fixed at zero."""
-  twist_cmd = cfg.commands["twist"]
-  assert isinstance(twist_cmd, UniformVelocityCommandCfg)
+  """G1-aligned vx/wz curriculum plus a dedicated pure-turn cohort."""
+  base_twist_cmd = cfg.commands["twist"]
+  assert isinstance(base_twist_cmd, UniformVelocityCommandCfg)
   vx, vy, wz = (-1.0, 1.0), (0.0, 0.0), (-1.0, 1.0)
-  twist_cmd.ranges.lin_vel_x = vx
-  twist_cmd.ranges.lin_vel_y = vy
-  twist_cmd.ranges.ang_vel_z = wz
+  twist_cmd = Casbot02VelocityCommandCfg(
+    resampling_time_range=base_twist_cmd.resampling_time_range,
+    debug_vis=base_twist_cmd.debug_vis,
+    entity_name=base_twist_cmd.entity_name,
+    heading_command=base_twist_cmd.heading_command,
+    heading_control_stiffness=base_twist_cmd.heading_control_stiffness,
+    rel_standing_envs=base_twist_cmd.rel_standing_envs,
+    rel_turning_envs=0.2,
+    rel_heading_envs=base_twist_cmd.rel_heading_envs,
+    rel_world_envs=base_twist_cmd.rel_world_envs,
+    rel_forward_envs=base_twist_cmd.rel_forward_envs,
+    init_velocity_prob=base_twist_cmd.init_velocity_prob,
+    min_turning_ang_vel=0.2,
+    ranges=Casbot02VelocityCommandCfg.Ranges(
+      lin_vel_x=vx,
+      lin_vel_y=vy,
+      ang_vel_z=wz,
+      heading=base_twist_cmd.ranges.heading,
+    ),
+    viz=base_twist_cmd.viz,
+  )
+  cfg.commands["twist"] = twist_cmd
 
   # Mirror G1's half-speed warmup, while keeping vy disabled in both stages.
   cfg.curriculum["command_vel"].params["velocity_stages"] = [
