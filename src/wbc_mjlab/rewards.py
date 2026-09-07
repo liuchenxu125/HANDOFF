@@ -1342,6 +1342,99 @@ def knee_distance_lateral(
   return too_close + too_far
 
 
+class straight_non_sagittal_target_deviation_l2:
+  """Penalize straight-walking roll/yaw position-target offsets.
+
+  A position-policy action is a virtual PD equilibrium, not the measured joint
+  position.  Consequently the posture reward can remain high while a large,
+  nearly constant target offset produces substantial internal torque against a
+  planted foot.  This term operates on ``action * scale`` (radians), so it
+  directly penalizes the target displacement from the action term's default
+  offset.  It is active for translational commands and smoothly fades out as
+  yaw-rate demand rises, preserving the policy's in-place turning authority.
+  """
+
+  def __init__(self, cfg: RewardTermCfg, env: ManagerBasedRlEnv):
+    self._action_term_name = cfg.params.get("action_term_name", "joint_pos")
+    action_term = env.action_manager.get_term(self._action_term_name)
+    joint_names = tuple(cfg.params["joint_names"])
+    missing = [name for name in joint_names if name not in action_term.target_names]
+    if missing:
+      raise ValueError(
+        "Target-deviation joints are not controlled by action term "
+        f"{self._action_term_name!r}: {missing}"
+      )
+    self._action_ids = torch.tensor(
+      [action_term.target_names.index(name) for name in joint_names],
+      device=env.device,
+      dtype=torch.long,
+    )
+    joint_weights = tuple(float(v) for v in cfg.params["joint_weights"])
+    if len(joint_weights) != len(joint_names):
+      raise ValueError(
+        "joint_weights must have one entry per joint: "
+        f"got {len(joint_weights)} weights for {len(joint_names)} joints"
+      )
+    self._joint_weights = torch.tensor(
+      joint_weights, device=env.device, dtype=torch.float32
+    )
+
+  def __call__(
+    self,
+    env: ManagerBasedRlEnv,
+    joint_names: tuple[str, ...],
+    joint_weights: tuple[float, ...],
+    command_name: str = "twist",
+    action_term_name: str = "joint_pos",
+    linear_command_threshold: float = 0.2,
+    yaw_relax_start: float = 0.15,
+    yaw_relax_end: float = 0.4,
+  ) -> torch.Tensor:
+    del joint_names, joint_weights, action_term_name
+    if yaw_relax_end <= yaw_relax_start:
+      raise ValueError(
+        f"yaw_relax_end ({yaw_relax_end}) must exceed "
+        f"yaw_relax_start ({yaw_relax_start})"
+      )
+
+    action_term = env.action_manager.get_term(self._action_term_name)
+    raw_action = action_term.raw_action[:, self._action_ids]
+    scale = action_term.scale
+    if isinstance(scale, torch.Tensor):
+      if scale.ndim == 2:
+        selected_scale = scale[:, self._action_ids]
+      else:
+        selected_scale = scale[self._action_ids].unsqueeze(0)
+      target_offset = raw_action * selected_scale
+    else:
+      target_offset = raw_action * float(scale)
+
+    cost = torch.sum(
+      torch.square(target_offset) * self._joint_weights.unsqueeze(0), dim=1
+    )
+    command = env.command_manager.get_command(command_name)
+    assert command is not None
+    translation_active = (
+      torch.linalg.vector_norm(command[:, :2], dim=1) > linear_command_threshold
+    ).float()
+    yaw_rate = torch.abs(command[:, 2])
+    turn_blend = torch.clamp(
+      (yaw_rate - yaw_relax_start) / (yaw_relax_end - yaw_relax_start),
+      min=0.0,
+      max=1.0,
+    )
+    straight_weight = translation_active * (1.0 - turn_blend)
+
+    active_count = torch.clamp(torch.sum(straight_weight), min=1.0)
+    env.extras["log"]["Metrics/non_sagittal_target_offset_rms"] = torch.sqrt(
+      torch.sum(
+        torch.mean(torch.square(target_offset), dim=1) * straight_weight
+      )
+      / active_count
+    )
+    return cost * straight_weight
+
+
 class dof_torque_limits:
   """HANDOFF normalized actuator-force-over-limit penalty."""
 
@@ -1608,7 +1701,6 @@ def motion_soft_landing(
 # ---------------------------------------------------------------------------
 # CBF reward (additive — attached only in the CBF task variant)
 # ---------------------------------------------------------------------------
-
 
 
 

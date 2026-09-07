@@ -11,7 +11,9 @@ from __future__ import annotations
 
 import argparse
 from collections import deque
+import csv
 from pathlib import Path
+import time
 
 import mujoco
 import numpy as np
@@ -58,6 +60,8 @@ DEFAULT_COMMAND = (0.5, 0.0, 0.0)  # 默认给个前进速度, 打开就能看�
 DEFAULT_VIEW_SPEED = 1.0
 DEFAULT_REALTIME = True
 PRINT_EVERY = 1.0  # 终端打印关节位置的时间间隔(秒)
+DEFAULT_LOG_CSV = ""
+DEFAULT_LOG_DECIMATION = 1
 COMMAND_X_RANGE = (-3.5, 5.0)
 COMMAND_Y_RANGE = (-1.0, 1.0)
 COMMAND_YAW_RANGE = (-3.14, 3.14)
@@ -89,6 +93,162 @@ def make_action_scale() -> np.ndarray:
     [CASBOT02_LEG_ONLY_ACTION_SCALE[n] for n in CASBOT02_LEG_ONLY_JOINT_NAMES],
     dtype=np.float64,
   )
+
+
+def resolve_csv_path(log_csv: str, model_path: Path) -> Path | None:
+  """Resolve the requested PlotJuggler-compatible CSV output path."""
+  if not log_csv:
+    return None
+  if log_csv.lower() == "auto":
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    return (
+      REPO_ROOT
+      / "logs"
+      / "sim2sim_csv"
+      / f"{model_path.stem}_{timestamp}.csv"
+    )
+  path = Path(log_csv).expanduser()
+  return path if path.is_absolute() else REPO_ROOT / path
+
+
+def quat_to_euler_xyz_wxyz(quat: np.ndarray) -> tuple[float, float, float]:
+  """Convert a MuJoCo wxyz quaternion to XYZ roll, pitch and yaw."""
+  w, x, y, z = quat
+  roll = np.arctan2(2.0 * (w * x + y * z), 1.0 - 2.0 * (x * x + y * y))
+  pitch = np.arcsin(np.clip(2.0 * (w * y - z * x), -1.0, 1.0))
+  yaw = np.arctan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
+  return float(roll), float(pitch), float(yaw)
+
+
+class PlotJugglerCsvLogger:
+  """Stream sim2sim state and actuator data to a generic PlotJuggler CSV."""
+
+  def __init__(self, path: Path, flush_every: int = 200) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    self.path = path
+    self._file = path.open("w", newline="", buffering=1024 * 1024)
+    self._writer = csv.writer(self._file)
+    self._flush_every = max(int(flush_every), 1)
+    self._rows_written = 0
+
+    header = [
+      "time",
+      "sim/step",
+      "policy/update",
+      "command/vx_m_s",
+      "command/vy_m_s",
+      "command/yaw_rate_rad_s",
+      "base/position/x_m",
+      "base/position/y_m",
+      "base/position/z_m",
+      "base/orientation/qw",
+      "base/orientation/qx",
+      "base/orientation/qy",
+      "base/orientation/qz",
+      "base/orientation/roll_rad",
+      "base/orientation/pitch_rad",
+      "base/orientation/yaw_rad",
+      "base/free_joint_linear_velocity/x_m_s",
+      "base/free_joint_linear_velocity/y_m_s",
+      "base/free_joint_linear_velocity/z_m_s",
+      "base/free_joint_angular_velocity/x_rad_s",
+      "base/free_joint_angular_velocity/y_rad_s",
+      "base/free_joint_angular_velocity/z_rad_s",
+      "base/imu_angular_velocity/x_rad_s",
+      "base/imu_angular_velocity/y_rad_s",
+      "base/imu_angular_velocity/z_rad_s",
+      "com/position_world/x_m",
+      "com/position_world/y_m",
+      "com/position_world/z_m",
+      "com/relative_to_base_world_axes/x_m",
+      "com/relative_to_base_world_axes/y_m",
+      "com/relative_to_base_world_axes/z_m",
+    ]
+    for side in ("left", "right"):
+      header.extend(
+        f"foot/{side}/position_world/{axis}_m" for axis in ("x", "y", "z")
+      )
+      header.extend(
+        f"foot/{side}/relative_to_base_world_axes/{axis}_m"
+        for axis in ("x", "y", "z")
+      )
+    header.extend(
+      f"policy/action/{name}" for name in CASBOT02_LEG_ONLY_JOINT_NAMES
+    )
+    for signal, unit in (
+      ("target_position", "rad"),
+      ("position", "rad"),
+      ("velocity", "rad_s"),
+      ("position_error", "rad"),
+      ("actuator_force", "Nm"),
+      ("generalized_actuator_force", "Nm"),
+    ):
+      header.extend(
+        f"joint/{signal}/{name}_{unit}" for name in CASBOT02_23DOF_JOINT_NAMES
+      )
+    self._writer.writerow(header)
+
+  def write(
+    self,
+    *,
+    step: int,
+    policy_updated: bool,
+    data: mujoco.MjData,
+    command: np.ndarray,
+    action: np.ndarray,
+    target_pos: np.ndarray,
+  ) -> None:
+    qpos = np.asarray(data.qpos[7:], dtype=np.float64)
+    qvel = np.asarray(data.qvel[6:], dtype=np.float64)
+    actuator_force = np.asarray(data.actuator_force, dtype=np.float64)
+    generalized_force = np.asarray(data.qfrc_actuator[6:], dtype=np.float64)
+    base_pos = np.asarray(data.qpos[0:3], dtype=np.float64)
+    base_quat = np.asarray(data.qpos[3:7], dtype=np.float64)
+    roll, pitch, yaw = quat_to_euler_xyz_wxyz(base_quat)
+    imu_ang_vel = np.asarray(
+      data.sensor("angular-velocity").data, dtype=np.float64
+    )
+    com_world = np.asarray(data.subtree_com[0], dtype=np.float64)
+    com_rel = com_world - base_pos
+    left_foot = np.asarray(data.site("left_foot").xpos, dtype=np.float64)
+    right_foot = np.asarray(data.site("right_foot").xpos, dtype=np.float64)
+
+    row: list[float | int] = [
+      float(data.time),
+      step,
+      int(policy_updated),
+      *command.tolist(),
+      *base_pos.tolist(),
+      *base_quat.tolist(),
+      roll,
+      pitch,
+      yaw,
+      *np.asarray(data.qvel[0:3], dtype=np.float64).tolist(),
+      *np.asarray(data.qvel[3:6], dtype=np.float64).tolist(),
+      *imu_ang_vel.tolist(),
+      *com_world.tolist(),
+      *com_rel.tolist(),
+      *left_foot.tolist(),
+      *(left_foot - base_pos).tolist(),
+      *right_foot.tolist(),
+      *(right_foot - base_pos).tolist(),
+      *np.asarray(action, dtype=np.float64).tolist(),
+      *np.asarray(target_pos, dtype=np.float64).tolist(),
+      *qpos.tolist(),
+      *qvel.tolist(),
+      *(target_pos - qpos).tolist(),
+      *actuator_force.tolist(),
+      *generalized_force.tolist(),
+    ]
+    self._writer.writerow(row)
+    self._rows_written += 1
+    if self._rows_written % self._flush_every == 0:
+      self._file.flush()
+
+  def close(self) -> None:
+    if not self._file.closed:
+      self._file.flush()
+      self._file.close()
 
 
 def quat_apply_inverse_wxyz(quat: np.ndarray, vec: np.ndarray) -> np.ndarray:
@@ -207,7 +367,11 @@ def install_command_controls(viewer, command: np.ndarray) -> None:
   viewer._create_overlay = create_overlay_with_command
 
 
-def run(model_arg: str = "") -> None:
+def run(
+  model_arg: str = "",
+  log_csv: str = DEFAULT_LOG_CSV,
+  log_decimation: int = DEFAULT_LOG_DECIMATION,
+) -> None:
   model_path = Path(model_arg) if model_arg else find_latest_onnx()
   if not model_path.is_absolute():
     model_path = REPO_ROOT / model_path
@@ -246,19 +410,28 @@ def run(model_arg: str = "") -> None:
   install_command_controls(viewer, command)
 
   print("[sim2sim] Up/Down=vx  Left/Right=yaw  Space=stop")
-  import time
   next_time = time.perf_counter()
   sim_time = 0.0
   physics_step = 0
   next_print_time = 0.0
   policy_dt = model.opt.timestep * POLICY_DECIMATION
+  if log_decimation < 1:
+    raise ValueError(f"log_decimation must be >= 1, got {log_decimation}")
   print(
     f"[sim2sim] dt={model.opt.timestep}, decimation={POLICY_DECIMATION}, "
     f"policy_hz={1.0 / policy_dt:.1f}"
   )
+  csv_path = resolve_csv_path(log_csv, model_path)
+  csv_logger = PlotJugglerCsvLogger(csv_path) if csv_path is not None else None
+  if csv_logger is not None:
+    print(
+      "[sim2sim] recording PlotJuggler CSV at "
+      f"{1.0 / (model.opt.timestep * log_decimation):.1f} Hz: {csv_path}"
+    )
   try:
     while viewer.is_alive:
-      if physics_step % POLICY_DECIMATION == 0:
+      policy_updated = physics_step % POLICY_DECIMATION == 0
+      if policy_updated:
         obs_frame = get_obs_frame(data, command, last_action, default_obs_joint_pos)
         if not history:  # 首步用当前帧回填整个历史
           for _ in range(HISTORY_LENGTH):
@@ -287,6 +460,15 @@ def run(model_arg: str = "") -> None:
 
       data.ctrl[:] = target_pos
       mujoco.mj_step(model, data)
+      if csv_logger is not None and physics_step % log_decimation == 0:
+        csv_logger.write(
+          step=physics_step,
+          policy_updated=policy_updated,
+          data=data,
+          command=command,
+          action=last_action,
+          target_pos=target_pos,
+        )
       physics_step += 1
       viewer.render()
       viewer.cam.lookat = [float(data.qpos[0]), float(data.qpos[1]), float(data.qpos[2])]
@@ -310,14 +492,35 @@ def run(model_arg: str = "") -> None:
         else:
           next_time = time.perf_counter()
   finally:
+    if csv_logger is not None:
+      csv_logger.close()
+      print(f"[sim2sim] PlotJuggler CSV saved: {csv_logger.path}")
     viewer.close()
 
 
 def parse_args() -> argparse.Namespace:
   p = argparse.ArgumentParser(description="Casbot02 loco teacher sim2sim")
   p.add_argument("model_path", nargs="?", default="", help="ONNX path (empty = latest)")
+  p.add_argument(
+    "--log-csv",
+    nargs="?",
+    const="auto",
+    default=DEFAULT_LOG_CSV,
+    metavar="PATH",
+    help=(
+      "Record a PlotJuggler-compatible CSV. Pass no PATH to save automatically "
+      "under logs/sim2sim_csv."
+    ),
+  )
+  p.add_argument(
+    "--log-decimation",
+    type=int,
+    default=DEFAULT_LOG_DECIMATION,
+    help="Record every N physics steps (default: 1 = 200 Hz).",
+  )
   return p.parse_args()
 
 
 if __name__ == "__main__":
-  run(parse_args().model_path)
+  args = parse_args()
+  run(args.model_path, args.log_csv, args.log_decimation)
