@@ -1342,6 +1342,79 @@ def knee_distance_lateral(
   return too_close + too_far
 
 
+class straight_hip_yaw_pos_l2:
+  """Penalize measured hip/ankle roll and hip-yaw motion while walking straight.
+
+  Despite the historical reward name, the selected joints are supplied by the
+  configuration and currently include both hip roll, hip yaw, and ankle roll
+  joints.  This complements the target-deviation term: it operates on measured
+  joint positions relative to the default pose rather than virtual PD targets.
+  The term is active only during translation and fades out as commanded yaw
+  rate increases, preserving turning authority.
+  """
+
+  def __init__(self, cfg: RewardTermCfg, env: ManagerBasedRlEnv):
+    joint_weights = tuple(float(v) for v in cfg.params["joint_weights"])
+    asset_cfg: SceneEntityCfg = cfg.params["asset_cfg"]
+    joint_names = tuple(asset_cfg.joint_names or ())
+    if len(joint_weights) != len(joint_names):
+      raise ValueError(
+        "joint_weights must have one entry per selected joint: "
+        f"got {len(joint_weights)} weights for {len(joint_names)} joints"
+      )
+    self._joint_weights = torch.tensor(
+      joint_weights, device=env.device, dtype=torch.float32
+    )
+
+  def __call__(
+    self,
+    env: ManagerBasedRlEnv,
+    asset_cfg: SceneEntityCfg,
+    joint_weights: tuple[float, ...],
+    command_name: str = "twist",
+    linear_command_threshold: float = 0.2,
+    yaw_relax_start: float = 0.15,
+    yaw_relax_end: float = 0.4,
+  ) -> torch.Tensor:
+    del joint_weights
+    if yaw_relax_end <= yaw_relax_start:
+      raise ValueError(
+        f"yaw_relax_end ({yaw_relax_end}) must exceed "
+        f"yaw_relax_start ({yaw_relax_start})"
+      )
+
+    asset = _get_robot(env, asset_cfg)
+    joint_pos_offset = (
+      asset.data.joint_pos[:, asset_cfg.joint_ids]
+      - asset.data.default_joint_pos[:, asset_cfg.joint_ids]
+    )
+    cost = torch.sum(
+      torch.square(joint_pos_offset) * self._joint_weights.unsqueeze(0), dim=1
+    )
+
+    command = env.command_manager.get_command(command_name)
+    assert command is not None
+    translation_active = (
+      torch.linalg.vector_norm(command[:, :2], dim=1) > linear_command_threshold
+    ).float()
+    yaw_rate = torch.abs(command[:, 2])
+    turn_blend = torch.clamp(
+      (yaw_rate - yaw_relax_start) / (yaw_relax_end - yaw_relax_start),
+      min=0.0,
+      max=1.0,
+    )
+    straight_weight = translation_active * (1.0 - turn_blend)
+
+    active_count = torch.clamp(torch.sum(straight_weight), min=1.0)
+    env.extras["log"]["Metrics/non_sagittal_joint_pos_rms"] = torch.sqrt(
+      torch.sum(
+        torch.mean(torch.square(joint_pos_offset), dim=1) * straight_weight
+      )
+      / active_count
+    )
+    return cost * straight_weight
+
+
 class straight_non_sagittal_target_deviation_l2:
   """Penalize straight-walking roll/yaw position-target offsets.
 
@@ -1701,8 +1774,6 @@ def motion_soft_landing(
 # ---------------------------------------------------------------------------
 # CBF reward (additive — attached only in the CBF task variant)
 # ---------------------------------------------------------------------------
-
-
 
 
 

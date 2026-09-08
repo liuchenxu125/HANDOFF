@@ -48,6 +48,13 @@ def _leg_asset() -> SceneEntityCfg:
   )
 
 
+def _leg_actuator_asset() -> SceneEntityCfg:
+  """SceneEntityCfg selecting only the 12 policy-controlled leg actuators."""
+  return SceneEntityCfg(
+    "robot", actuator_names=C.CASBOT02_LEG_ONLY_JOINT_NAMES, preserve_order=True
+  )
+
+
 def _torso_asset() -> SceneEntityCfg:
   return SceneEntityCfg("robot", body_names=("torso",))
 
@@ -78,6 +85,22 @@ def _roll_yaw_actuator_asset() -> SceneEntityCfg:
   return SceneEntityCfg(
     "robot",
     actuator_names=(
+      "leg_l2_joint",  # hip roll
+      "leg_l3_joint",  # hip yaw
+      "leg_l6_joint",  # ankle roll
+      "leg_r2_joint",
+      "leg_r3_joint",
+      "leg_r6_joint",
+    ),
+    preserve_order=True,
+  )
+
+
+def _roll_yaw_joint_asset() -> SceneEntityCfg:
+  """Select the six measured non-sagittal leg joint positions."""
+  return SceneEntityCfg(
+    "robot",
+    joint_names=(
       "leg_l2_joint",  # hip roll
       "leg_l3_joint",  # hip yaw
       "leg_l6_joint",  # ankle roll
@@ -307,7 +330,7 @@ def _apply_loco_rewards(cfg: ManagerBasedRlEnvCfg) -> None:
     weight=2.0,
     params={
       "asset_cfg": _feet_site_asset(),
-      "min_distance": 0.265,
+      "min_distance": 0.255,
       "max_distance": 0.35,
     },
   )
@@ -316,7 +339,7 @@ def _apply_loco_rewards(cfg: ManagerBasedRlEnvCfg) -> None:
     weight=2.0,
     params={
       "asset_cfg": _knee_body_asset(),
-      "min_distance": 0.265,
+      "min_distance": 0.255,
       "max_distance": 0.35,
     },
   )
@@ -331,39 +354,54 @@ def _apply_loco_rewards(cfg: ManagerBasedRlEnvCfg) -> None:
   cfg.rewards["body_ang_vel"].weight = -0.5
   cfg.rewards["body_ang_vel"].params["asset_cfg"] = _torso_asset()
   cfg.rewards["angular_momentum"].weight = -0.02
-  # Penalize virtual PD-equilibrium offsets during straight translation.  Hip
-  # yaw is weighted most strongly; hip/ankle roll retain authority for lateral
-  # load transfer.  The term fades out between 0.15 and 0.40 rad/s yaw command.
-  cfg.rewards["straight_non_sagittal_target_deviation_l2"] = RewardTermCfg(
-    func=wbc_rewards.straight_non_sagittal_target_deviation_l2,
-    weight=-0.5,
+  # Constrain measured non-sagittal joint motion during straight translation.
+  # Hip yaw is weighted most strongly, while hip/ankle roll retain authority
+  # for lateral load transfer.  The constraint fades out for turning commands.
+  cfg.rewards["straight_hip_yaw_pos_l2"] = RewardTermCfg(
+    func=wbc_rewards.straight_hip_yaw_pos_l2,
+    weight=-5.0,
     params={
       "command_name": "twist",
-      "action_term_name": "joint_pos",
-      "joint_names": (
-        "leg_l2_joint",
-        "leg_l3_joint",
-        "leg_l6_joint",
-        "leg_r2_joint",
-        "leg_r3_joint",
-        "leg_r6_joint",
-      ),
-      "joint_weights": (0.25, 1.0, 0.25, 0.25, 1.0, 0.5),
+      "asset_cfg": _roll_yaw_joint_asset(),
+      "joint_weights": (0.25, 1.0, 0.25, 0.25, 1.0, 0.25),
       "linear_command_threshold": 0.2,
       "yaw_relax_start": 0.15,
       "yaw_relax_end": 0.4,
     },
   )
-  cfg.rewards["roll_yaw_torques_l2"] = RewardTermCfg(
+  # Penalize virtual PD-equilibrium offsets during straight translation.  Hip
+  # yaw is weighted most strongly; hip/ankle roll retain authority for lateral
+  # load transfer.  The term fades out between 0.15 and 0.40 rad/s yaw command.
+  # cfg.rewards["straight_non_sagittal_target_deviation_l2"] = RewardTermCfg(
+  #   func=wbc_rewards.straight_non_sagittal_target_deviation_l2,
+  #   weight=-0.5,
+  #   params={
+  #     "command_name": "twist",
+  #     "action_term_name": "joint_pos",
+  #     "joint_names": (
+  #       "leg_l2_joint",
+  #       "leg_l3_joint",
+  #       "leg_l6_joint",
+  #       "leg_r2_joint",
+  #       "leg_r3_joint",
+  #       "leg_r6_joint",
+  #     ),
+  #     "joint_weights": (0.5, 1.0, 0.5, 0.5, 1.0, 0.5),
+  #     "linear_command_threshold": 0.2,
+  #     "yaw_relax_start": 0.15,
+  #     "yaw_relax_end": 0.4,
+  #   },
+  # )
+  cfg.rewards["leg_torques_l2"] = RewardTermCfg(
     func=env_mdp.joint_torques_l2,
     weight=-5.0e-6,
-    params={"asset_cfg": _roll_yaw_actuator_asset()},
+    params={"asset_cfg": _leg_actuator_asset()},
   )
   # Penalize only the part of actuator effort above 80% of its physical limit.
   # At the measured 0.5 m/s gait this primarily targets ankle-pitch saturation.
   cfg.rewards["dof_torque_limits"] = RewardTermCfg(
     func=wbc_rewards.dof_torque_limits,
-    weight=-0.5,
+    weight=-1,
     params={
       "asset_cfg": SceneEntityCfg("robot", actuator_names=(".*",)),
       "soft_torque_limit": 0.8,
