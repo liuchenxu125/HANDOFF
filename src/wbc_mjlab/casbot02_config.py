@@ -230,7 +230,7 @@ def _apply_loco_rewards(cfg: ManagerBasedRlEnvCfg) -> None:
       # curve comes from 原地左转/右转.npz: ~6.4-6.7 cm and ~0.40 s.
       "translation_peak_height": (0.114, 0.114),
       "turning_peak_height": (0.065, 0.065),
-      "translation_swing_time": (0.59, 0.59),
+      "translation_swing_time": (0.55, 0.55),
       "turning_swing_time": (0.40, 0.40),
       "command_name": "twist",
       "command_threshold": 0.2,
@@ -255,9 +255,9 @@ def _apply_loco_rewards(cfg: ManagerBasedRlEnvCfg) -> None:
       "turning_angular_threshold": 0.2,
     },
   )
-  cfg.rewards["foot_slip"].weight = -0.5
+  cfg.rewards["foot_slip"].weight = -0.2
   cfg.rewards["foot_slip"].params["asset_cfg"] = _feet_site_asset()
-  cfg.rewards["soft_landing"].weight = -5e-3
+  cfg.rewards["soft_landing"].weight = -6e-3
 
   # 保留密集 air_time 信号：直行窗口保持 0.05~0.60 s，纯转弯缩短为
   # 0.05~0.42 s；高度曲线分别在 0.59/0.40 s 回到零。
@@ -280,18 +280,18 @@ def _apply_loco_rewards(cfg: ManagerBasedRlEnvCfg) -> None:
   cfg.rewards["track_linear_velocity"].params["asset_cfg"] = _torso_asset()
   cfg.rewards["track_linear_velocity"].params["std"] = 0.5
   cfg.rewards["track_angular_velocity"].params["asset_cfg"] = _torso_asset()
-  cfg.rewards["track_angular_velocity"].params["std"] = 0.5
+  cfg.rewards["track_angular_velocity"].params["std"] = 0.7071
   cfg.rewards["upright"].params["asset_cfg"] = _torso_asset()
-  cfg.rewards["pose"].weight = 1.2
+  cfg.rewards["pose"].weight = 1.0
   cfg.rewards["pose"].params["asset_cfg"] = _leg_asset()
   cfg.rewards["pose"].params["std_standing"] = {".*": 0.05}
   cfg.rewards["pose"].params["std_walking"] = {
     r"leg_[lr]1_joint": 0.3,   # hip pitch
-    r"leg_[lr]2_joint": 0.10,  # hip roll
-    r"leg_[lr]3_joint": 0.10,  # hip yaw
+    r"leg_[lr]2_joint": 0.15,  # hip roll
+    r"leg_[lr]3_joint": 0.15,  # hip yaw
     r"leg_[lr]4_joint": 0.35,  # knee
     r"leg_[lr]5_joint": 0.25,  # ankle pitch
-    r"leg_[lr]6_joint": 0.08,   # ankle roll
+    r"leg_[lr]6_joint": 0.1,   # ankle roll
   }
   cfg.rewards["pose"].params["std_running"] = {
     r"leg_[lr]1_joint": 0.5,   # hip pitch
@@ -305,7 +305,7 @@ def _apply_loco_rewards(cfg: ManagerBasedRlEnvCfg) -> None:
   # 12 policy-controlled leg joints (the arms follow the deterministic swing).
   cfg.rewards["stand_pose"] = RewardTermCfg(
     func=wbc_rewards.stand_pose,
-    weight=-10.0,
+    weight=-4.0,
     params={
       "command_name": "twist",
       "asset_cfg": _leg_asset(),
@@ -327,48 +327,47 @@ def _apply_loco_rewards(cfg: ManagerBasedRlEnvCfg) -> None:
   # intentional: the reward function returns a negative error outside this band.
   cfg.rewards["feet_distance_lateral"] = RewardTermCfg(
     func=wbc_rewards.feet_distance_lateral,
-    weight=2.0,
+    weight=3.0,
     params={
       "asset_cfg": _feet_site_asset(),
-      "min_distance": 0.255,
+      "min_distance": 0.265,
       "max_distance": 0.35,
     },
   )
   cfg.rewards["knee_distance_lateral"] = RewardTermCfg(
     func=wbc_rewards.knee_distance_lateral,
-    weight=2.0,
+    weight=3.0,
     params={
       "asset_cfg": _knee_body_asset(),
-      "min_distance": 0.255,
+      "min_distance": 0.265,
       "max_distance": 0.35,
     },
   )
   cfg.rewards["flat_foot"] = RewardTermCfg(
     func=wbc_rewards.flat_foot,
-    weight=-0.5,
+    weight=-1,
     params={
       "sensor_name": "feet_ground_contact",
       "asset_cfg": _feet_body_asset(),
     },
   )
-  cfg.rewards["body_ang_vel"].weight = -0.5
+  cfg.rewards["body_ang_vel"].weight = -0.05
   cfg.rewards["body_ang_vel"].params["asset_cfg"] = _torso_asset()
   cfg.rewards["angular_momentum"].weight = -0.02
-  # Constrain measured non-sagittal joint motion during straight translation.
-  # Hip yaw is weighted most strongly, while hip/ankle roll retain authority
-  # for lateral load transfer.  The constraint fades out for turning commands.
-  cfg.rewards["straight_hip_yaw_pos_l2"] = RewardTermCfg(
-    func=wbc_rewards.straight_hip_yaw_pos_l2,
-    weight=-5.0,
-    params={
-      "command_name": "twist",
-      "asset_cfg": _roll_yaw_joint_asset(),
-      "joint_weights": (0.25, 1.0, 0.25, 0.25, 1.0, 0.25),
-      "linear_command_threshold": 0.2,
-      "yaw_relax_start": 0.15,
-      "yaw_relax_end": 0.4,
-    },
-  )
+  # Added after the 2026-09-02 reference run; keep disabled while reproducing
+  # that policy's reward configuration.
+  # cfg.rewards["straight_hip_yaw_pos_l2"] = RewardTermCfg(
+  #   func=wbc_rewards.straight_hip_yaw_pos_l2,
+  #   weight=-5.0,
+  #   params={
+  #     "command_name": "twist",
+  #     "asset_cfg": _roll_yaw_joint_asset(),
+  #     "joint_weights": (0.5, 1.0, 0.5, 0.5, 1.0, 0.5),
+  #     "linear_command_threshold": 0.2,
+  #     "yaw_relax_start": 0.15,
+  #     "yaw_relax_end": 0.4,
+  #   },
+  # )
   # Penalize virtual PD-equilibrium offsets during straight translation.  Hip
   # yaw is weighted most strongly; hip/ankle roll retain authority for lateral
   # load transfer.  The term fades out between 0.15 and 0.40 rad/s yaw command.
@@ -392,21 +391,34 @@ def _apply_loco_rewards(cfg: ManagerBasedRlEnvCfg) -> None:
   #     "yaw_relax_end": 0.4,
   #   },
   # )
-  cfg.rewards["leg_torques_l2"] = RewardTermCfg(
-    func=env_mdp.joint_torques_l2,
-    weight=-5.0e-6,
-    params={"asset_cfg": _leg_actuator_asset()},
-  )
+  # cfg.rewards["leg_torques_l2"] = RewardTermCfg(
+  #   func=env_mdp.joint_torques_l2,
+  #   weight=-5.0e-6,
+  #   params={"asset_cfg": _leg_actuator_asset()},
+  # )
+  # Suppress persistent hip-roll closed-chain internal torques without
+  # penalizing the other ten policy-controlled leg actuators.
+  # cfg.rewards["hip_roll_torques_l2"] = RewardTermCfg(
+  #   func=env_mdp.joint_torques_l2,
+  #   weight=-5.0e-6,
+  #   params={
+  #     "asset_cfg": SceneEntityCfg(
+  #       "robot",
+  #       actuator_names=("leg_l2_joint", "leg_r2_joint"),
+  #       preserve_order=True,
+  #     )
+  #   },
+  # )
   # Penalize only the part of actuator effort above 80% of its physical limit.
   # At the measured 0.5 m/s gait this primarily targets ankle-pitch saturation.
-  cfg.rewards["dof_torque_limits"] = RewardTermCfg(
-    func=wbc_rewards.dof_torque_limits,
-    weight=-1,
-    params={
-      "asset_cfg": SceneEntityCfg("robot", actuator_names=(".*",)),
-      "soft_torque_limit": 0.8,
-    },
-  )
+  # cfg.rewards["dof_torque_limits"] = RewardTermCfg(
+  #   func=wbc_rewards.dof_torque_limits,
+  #   weight=-1,
+  #   params={
+  #     "asset_cfg": SceneEntityCfg("robot", actuator_names=(".*",)),
+  #     "soft_torque_limit": 0.8,
+  #   },
+  # )
   cfg.rewards["self_collisions"] = RewardTermCfg(
     func=velocity_mdp.self_collision_cost,
     weight=-1.0,
@@ -421,13 +433,13 @@ def _apply_casbot02_dr(cfg: ManagerBasedRlEnvCfg) -> None:
     "robot", geom_names=C.CASBOT02_FOOT_GEOM_NAMES, preserve_order=True
   )
 
-  # 2. base_mass: 躯干质量 add ±1.0 kg。
+  # 2. base_mass: 躯干质量 add ±4.0 kg。
   cfg.events["base_mass"] = EventTermCfg(
     mode="startup",
     func=dr.body_mass,
     params={
       "asset_cfg": SceneEntityCfg("robot", body_names=("torso",)),
-      "ranges": (-1.0, 1.0),
+      "ranges": (-4.0, 4.0),
       "operation": "add",
       "distribution": "uniform",
     },
@@ -458,12 +470,12 @@ def _apply_casbot02_dr(cfg: ManagerBasedRlEnvCfg) -> None:
     },
   )
 
-  # 5. base_com: 躯干质心偏移(原配置 body_names 为空, 是 no-op)。
+  # 5. base_com: 躯干质心偏移。
   cfg.events["base_com"].params["asset_cfg"] = SceneEntityCfg(
     "robot", body_names=("torso",)
   )
 
-  # 6. joint_default_pos: 零位偏移 ±0.01 rad。
+  # 6. joint_default_pos: 零位偏移 ±0.02 rad。
   cfg.events["joint_default_pos"] = EventTermCfg(
     mode="startup",
     func=dr.joint_default_pos,
@@ -481,12 +493,23 @@ def _apply_casbot02_dr(cfg: ManagerBasedRlEnvCfg) -> None:
     func=dr.body_mass,
     params={
       "asset_cfg": SceneEntityCfg("robot", body_names=(r"^(?!torso$).+$",)),
-      "ranges": (0.85, 1.15),
+      "ranges": (0.80, 1.20),
       "operation": "scale",
       "distribution": "uniform",
       "shared_random": False,
     },
   )
+
+  # 8. push_robot: match RoboParty AMP's lower-frequency planar velocity
+  # disturbance.  Keep vertical/roll/pitch kicks disabled so most rollout
+  # time is spent learning a clean nominal gait.
+  # push_robot = cfg.events["push_robot"]
+  # push_robot.interval_range_s = (5.0, 10.0)
+  # push_robot.params["velocity_range"] = {
+  #   "x": (-0.5, 0.5),
+  #   "y": (-0.5, 0.5),
+  #   "yaw": (-1.0, 1.0),
+  # }
 
 
 def _apply_twist_ranges(cfg: ManagerBasedRlEnvCfg) -> None:
