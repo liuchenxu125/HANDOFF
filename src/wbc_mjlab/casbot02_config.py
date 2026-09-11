@@ -228,9 +228,9 @@ def _apply_loco_rewards(cfg: ManagerBasedRlEnvCfg) -> None:
       "height_sensor_name": "foot_height_scan",
       # Straight walking retains the tuned forward-data curve.  The pure-turn
       # curve comes from 原地左转/右转.npz: ~6.4-6.7 cm and ~0.40 s.
-      "translation_peak_height": (0.114, 0.114),
+      "translation_peak_height": (0.128, 0.128),
       "turning_peak_height": (0.065, 0.065),
-      "translation_swing_time": (0.55, 0.55),
+      "translation_swing_time": (0.585, 0.585),
       "turning_swing_time": (0.40, 0.40),
       "command_name": "twist",
       "command_threshold": 0.2,
@@ -247,15 +247,15 @@ def _apply_loco_rewards(cfg: ManagerBasedRlEnvCfg) -> None:
     params={
       "sensor_name": "feet_ground_contact",
       "height_sensor_name": "foot_height_scan",
-      "translation_target_height": 0.12,
-      "turning_target_height": 0.07,
+      "translation_target_height": 0.128,
+      "turning_target_height": 0.065,
       "command_name": "twist",
       "command_threshold": 0.05,
       "turning_linear_threshold": 0.2,
       "turning_angular_threshold": 0.2,
     },
   )
-  cfg.rewards["foot_slip"].weight = -0.2
+  cfg.rewards["foot_slip"].weight = -0.1
   cfg.rewards["foot_slip"].params["asset_cfg"] = _feet_site_asset()
   cfg.rewards["soft_landing"].weight = -6e-3
 
@@ -345,7 +345,7 @@ def _apply_loco_rewards(cfg: ManagerBasedRlEnvCfg) -> None:
   )
   cfg.rewards["flat_foot"] = RewardTermCfg(
     func=wbc_rewards.flat_foot,
-    weight=-1,
+    weight=-0.1,
     params={
       "sensor_name": "feet_ground_contact",
       "asset_cfg": _feet_body_asset(),
