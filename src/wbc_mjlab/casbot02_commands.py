@@ -12,11 +12,11 @@ from mjlab.utils.lab_api.math import quat_apply
 
 
 class Casbot02VelocityCommand(UniformVelocityCommand):
-  """Uniform velocity command with a mutually exclusive pure-turn cohort.
+  """Uniform velocity command with pure-turn and stand-to-start cohorts.
 
-  The configured standing, pure-turn, forward and heading fractions are
-  interpreted as absolute, mutually exclusive fractions of environments.
-  Remaining environments retain independently sampled ``vx``/``wz`` commands.
+  The configured standing, pure-turn, forward, startup, and heading fractions
+  are absolute and mutually exclusive.  Remaining environments retain
+  independently sampled ``vx``/``wz`` commands.
   """
 
   cfg: Casbot02VelocityCommandCfg
@@ -24,6 +24,21 @@ class Casbot02VelocityCommand(UniformVelocityCommand):
   def __init__(self, cfg: Casbot02VelocityCommandCfg, env) -> None:
     super().__init__(cfg, env)
     self.is_turning_env = torch.zeros_like(self.is_standing_env)
+    self.is_startup_env = torch.zeros_like(self.is_standing_env)
+    self.startup_walk_duration = torch.zeros_like(self.time_left)
+    self.startup_target_vx = torch.zeros_like(self.time_left)
+
+  def _update_command(self) -> None:
+    # The base command timer spans both phases, so ordinary resampling cannot
+    # interrupt the standing hold before the startup has been practiced.
+    startup = self.is_startup_env
+    holding = self.time_left > self.startup_walk_duration
+    self.is_standing_env[startup] = holding[startup]
+    self.vel_command_b[startup, 0] = torch.where(
+      holding[startup], 0.0, self.startup_target_vx[startup]
+    )
+    self.vel_command_b[startup, 1:] = 0.0
+    super()._update_command()
 
   def _sample_turning_yaw_rate(self, count: int) -> torch.Tensor:
     if count == 0:
@@ -67,18 +82,23 @@ class Casbot02VelocityCommand(UniformVelocityCommand):
     standing_end = self.cfg.rel_standing_envs
     turning_end = standing_end + self.cfg.rel_turning_envs
     forward_end = turning_end + self.cfg.rel_forward_envs
-    heading_end = forward_end + (
+    startup_end = forward_end + self.cfg.rel_startup_envs
+    heading_end = startup_end + (
       self.cfg.rel_heading_envs if self.cfg.heading_command else 0.0
     )
 
     standing = mode < standing_end
     turning = (mode >= standing_end) & (mode < turning_end)
     forward = (mode >= turning_end) & (mode < forward_end)
-    heading = (mode >= forward_end) & (mode < heading_end)
+    startup = (mode >= forward_end) & (mode < startup_end)
+    heading = (mode >= startup_end) & (mode < heading_end)
 
-    self.is_standing_env[env_ids] = standing
+    self.is_standing_env[env_ids] = standing | startup
     self.is_turning_env[env_ids] = turning
     self.is_forward_env[env_ids] = forward
+    self.is_startup_env[env_ids] = startup
+    self.startup_walk_duration[env_ids] = 0.0
+    self.startup_target_vx[env_ids] = 0.0
     self.is_heading_env[env_ids] = heading
 
     # Pure in-place turn: vx=vy=0, non-trivial yaw rate of either sign.
@@ -95,16 +115,39 @@ class Casbot02VelocityCommand(UniformVelocityCommand):
     )
     self.vel_command_b[forward_ids, 1:] = 0.0
 
+    # Hold zero command, then step to a forward/backward command with equal
+    # probability. Respect the live curriculum range, including warmup.
+    startup_ids = env_ids[startup]
+    n_startup = len(startup_ids)
+    lo, hi = self.cfg.ranges.lin_vel_x
+    if n_startup and not lo < 0.0 < hi:
+      raise ValueError("Startup sampling requires lin_vel_x to span both signs")
+    positive = torch.rand(n_startup, device=self.device) < 0.5
+    min_speed, max_speed = self.cfg.startup_speed_range
+    upper = torch.where(positive, hi, -lo).clamp(max=max_speed)
+    lower = upper.clamp(max=min_speed)
+    magnitude = lower + torch.rand(n_startup, device=self.device) * (upper - lower)
+    self.startup_target_vx[startup_ids] = torch.where(positive, magnitude, -magnitude)
+    hold = torch.empty(n_startup, device=self.device).uniform_(
+      *self.cfg.startup_standing_time_range
+    )
+    walk = torch.empty(n_startup, device=self.device).uniform_(
+      *self.cfg.startup_walking_time_range
+    )
+    self.startup_walk_duration[startup_ids] = walk
+    self.time_left[startup_ids] = hold + walk
+    self.vel_command_b[startup_ids] = 0.0
+
     # World-frame commands are unused by Casbot02, but retain base-class
     # behavior for any future non-zero configuration.
     self.is_world_env[env_ids] = (
       torch.rand(count, device=self.device) <= self.cfg.rel_world_envs
-    ) & ~(standing | turning | forward | heading)
+    ) & ~(standing | turning | forward | startup | heading)
     self.vel_command_w[env_ids] = self.vel_command_b[env_ids]
 
     init_velocity_mask = (
       torch.rand(count, device=self.device) < self.cfg.init_velocity_prob
-    )
+    ) & ~startup
     init_velocity_env_ids = env_ids[init_velocity_mask]
     if len(init_velocity_env_ids) > 0:
       root_pos = self.robot.data.root_link_pos_w[init_velocity_env_ids]
@@ -127,7 +170,11 @@ class Casbot02VelocityCommandCfg(UniformVelocityCommandCfg):
   """Configuration for :class:`Casbot02VelocityCommand`."""
 
   rel_turning_envs: float = 0.2
+  rel_startup_envs: float = 0.0
   min_turning_ang_vel: float = 0.2
+  startup_standing_time_range: tuple[float, float] = (2.0, 3.0)
+  startup_walking_time_range: tuple[float, float] = (3.0, 4.0)
+  startup_speed_range: tuple[float, float] = (0.3, 0.6)
 
   def build(self, env) -> Casbot02VelocityCommand:
     return Casbot02VelocityCommand(self, env)
@@ -138,17 +185,25 @@ class Casbot02VelocityCommandCfg(UniformVelocityCommandCfg):
       self.rel_standing_envs,
       self.rel_turning_envs,
       self.rel_forward_envs,
+      self.rel_startup_envs,
       self.rel_heading_envs if self.heading_command else 0.0,
     )
     if any(value < 0.0 for value in fractions):
       raise ValueError(f"Command mode fractions must be non-negative: {fractions}")
     if sum(fractions) > 1.0 + 1.0e-8:
       raise ValueError(
-        "Standing + turning + forward + heading command fractions must not "
+        "Standing + turning + forward + startup + heading command fractions "
+        "must not "
         f"exceed 1.0, got {sum(fractions):.3f}"
       )
     if self.min_turning_ang_vel <= 0.0:
       raise ValueError("min_turning_ang_vel must be positive")
+    for name in (
+      "startup_standing_time_range", "startup_walking_time_range", "startup_speed_range"
+    ):
+      lo, hi = getattr(self, name)
+      if not 0.0 < lo <= hi:
+        raise ValueError(f"{name} must satisfy 0 < min <= max")
 
 
 __all__ = ["Casbot02VelocityCommand", "Casbot02VelocityCommandCfg"]

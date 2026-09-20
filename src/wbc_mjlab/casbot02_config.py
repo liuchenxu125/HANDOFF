@@ -41,6 +41,24 @@ from wbc_mjlab.casbot02_actions import Casbot02LegWithArmSwingActionCfg
 from wbc_mjlab.casbot02_commands import Casbot02VelocityCommandCfg
 
 
+# Forward-only gait targets fitted conservatively from the CASBOT02 sole-site
+# motion data.  Backward motion retains the fixed 09-02 targets and pure turn
+# remains independent and unchanged below.
+_TRANSLATION_SPEED_KNOTS = (0.15, 0.30, 0.50, 0.80, 1.00)
+_TRANSLATION_STEP_LENGTH_KNOTS = (0.11, 0.19, 0.31, 0.51, 0.55)
+_TRANSLATION_PEAK_HEIGHT_KNOTS = (0.090, 0.100, 0.114, 0.150, 0.170)
+# Keep forward timing fixed over speed: speed changes are expressed through
+# step length and peak height instead of a second, competing cadence curve.
+_TRANSLATION_SWING_TIME_KNOTS = (0.585, 0.585, 0.585, 0.585, 0.585)
+_TRANSLATION_AIR_TIME_MAX_KNOTS = (0.60, 0.60, 0.60, 0.60, 0.60)
+_TRANSLATION_ACTIVATION_START = 0.10
+_TRANSLATION_ACTIVATION_END = 0.15
+_BACKWARD_PEAK_HEIGHT = 0.114
+_BACKWARD_SWING_TIME = 0.59
+_BACKWARD_LANDING_HEIGHT = 0.12
+_BACKWARD_AIR_TIME_MAX = 0.60
+
+
 def _leg_asset() -> SceneEntityCfg:
   """SceneEntityCfg selecting only the 12 policy-controlled leg joints."""
   return SceneEntityCfg(
@@ -217,8 +235,9 @@ def _apply_flat_terrain(cfg: ManagerBasedRlEnvCfg) -> None:
 def _apply_loco_rewards(cfg: ManagerBasedRlEnvCfg) -> None:
   """Casbot02 velocity-tracking reward stack with G1 foot shaping."""
 
-  # 用每只脚的当前腾空时间作为摆动进度，跟踪半正弦高度曲线。
-  # AMP 前进数据：左/右峰值 11.6/11.4 cm，摆动时间 0.55/0.59 s。
+  # Use air time as swing phase.  Positive vx follows the new speed curve;
+  # negative vx uses the fixed targets saved by the 09-02 baseline.  The
+  # already-tuned pure-turn curve stays fixed.
   cfg.rewards.pop("foot_clearance", None)
   cfg.rewards["swing_height_curve"] = RewardTermCfg(
     func=wbc_rewards.command_conditioned_swing_height_curve,
@@ -226,14 +245,18 @@ def _apply_loco_rewards(cfg: ManagerBasedRlEnvCfg) -> None:
     params={
       "sensor_name": "feet_ground_contact",
       "height_sensor_name": "foot_height_scan",
-      # Straight walking retains the tuned forward-data curve.  The pure-turn
-      # curve comes from 原地左转/右转.npz: ~6.4-6.7 cm and ~0.40 s.
-      "translation_peak_height": (0.128, 0.128),
+      "translation_speed_knots": _TRANSLATION_SPEED_KNOTS,
+      "translation_peak_height_knots": _TRANSLATION_PEAK_HEIGHT_KNOTS,
+      "translation_swing_time_knots": _TRANSLATION_SWING_TIME_KNOTS,
+      "backward_peak_height": _BACKWARD_PEAK_HEIGHT,
+      "backward_swing_time": _BACKWARD_SWING_TIME,
+      # Frozen pure-turn targets from 原地左转/右转.npz.
       "turning_peak_height": (0.065, 0.065),
-      "translation_swing_time": (0.585, 0.585),
       "turning_swing_time": (0.40, 0.40),
       "command_name": "twist",
       "command_threshold": 0.2,
+      "translation_activation_start": _TRANSLATION_ACTIVATION_START,
+      "translation_activation_end": _TRANSLATION_ACTIVATION_END,
       "turning_linear_threshold": 0.2,
       "turning_angular_threshold": 0.2,
     },
@@ -247,30 +270,54 @@ def _apply_loco_rewards(cfg: ManagerBasedRlEnvCfg) -> None:
     params={
       "sensor_name": "feet_ground_contact",
       "height_sensor_name": "foot_height_scan",
-      "translation_target_height": 0.128,
-      "turning_target_height": 0.065,
+      "translation_speed_knots": _TRANSLATION_SPEED_KNOTS,
+      "translation_target_height_knots": _TRANSLATION_PEAK_HEIGHT_KNOTS,
+      "backward_target_height": _BACKWARD_LANDING_HEIGHT,
+      "turning_target_height": 0.07,
       "command_name": "twist",
       "command_threshold": 0.05,
+      "translation_activation_start": _TRANSLATION_ACTIVATION_START,
+      "translation_activation_end": _TRANSLATION_ACTIVATION_END,
       "turning_linear_threshold": 0.2,
       "turning_angular_threshold": 0.2,
     },
   )
-  cfg.rewards["foot_slip"].weight = -0.1
+  cfg.rewards["foot_slip"].weight = -2
   cfg.rewards["foot_slip"].params["asset_cfg"] = _feet_site_asset()
   cfg.rewards["soft_landing"].weight = -6e-3
 
-  # 保留密集 air_time 信号：直行窗口保持 0.05~0.60 s，纯转弯缩短为
-  # 0.05~0.42 s；高度曲线分别在 0.59/0.40 s 回到零。
+  # Keep the dense air-time signal, but shorten its translation window with
+  # speed.  The pure-turn upper bound remains exactly 0.42 s.
   cfg.rewards["air_time"] = RewardTermCfg(
     func=wbc_rewards.command_conditioned_feet_air_time,
     weight=1.0,
     params={
       "sensor_name": "feet_ground_contact",
       "threshold_min": 0.05,
-      "translation_threshold_max": 0.60,
+      "translation_speed_knots": _TRANSLATION_SPEED_KNOTS,
+      "translation_threshold_max_knots": _TRANSLATION_AIR_TIME_MAX_KNOTS,
+      "backward_threshold_max": _BACKWARD_AIR_TIME_MAX,
       "turning_threshold_max": 0.42,
       "command_name": "twist",
       "command_threshold": 0.2,
+      "translation_activation_start": _TRANSLATION_ACTIVATION_START,
+      "translation_activation_end": _TRANSLATION_ACTIVATION_END,
+      "turning_linear_threshold": 0.2,
+      "turning_angular_threshold": 0.2,
+    },
+  )
+  # This reward did not exist in the 09-02 baseline, so it is forward-only.
+  cfg.rewards["feet_step_length"] = RewardTermCfg(
+    func=wbc_rewards.command_conditioned_feet_step_length,
+    weight=-0.5,
+    params={
+      "sensor_name": "feet_ground_contact",
+      "asset_cfg": _feet_site_asset(),
+      "translation_speed_knots": _TRANSLATION_SPEED_KNOTS,
+      "translation_step_length_knots": _TRANSLATION_STEP_LENGTH_KNOTS,
+      "command_name": "twist",
+      "translation_activation_start": _TRANSLATION_ACTIVATION_START,
+      "translation_activation_end": _TRANSLATION_ACTIVATION_END,
       "turning_linear_threshold": 0.2,
       "turning_angular_threshold": 0.2,
     },
@@ -305,7 +352,7 @@ def _apply_loco_rewards(cfg: ManagerBasedRlEnvCfg) -> None:
   # 12 policy-controlled leg joints (the arms follow the deterministic swing).
   cfg.rewards["stand_pose"] = RewardTermCfg(
     func=wbc_rewards.stand_pose,
-    weight=-4.0,
+    weight=-3.0,
     params={
       "command_name": "twist",
       "asset_cfg": _leg_asset(),
@@ -327,25 +374,25 @@ def _apply_loco_rewards(cfg: ManagerBasedRlEnvCfg) -> None:
   # intentional: the reward function returns a negative error outside this band.
   cfg.rewards["feet_distance_lateral"] = RewardTermCfg(
     func=wbc_rewards.feet_distance_lateral,
-    weight=3.0,
+    weight=3,
     params={
       "asset_cfg": _feet_site_asset(),
-      "min_distance": 0.265,
-      "max_distance": 0.35,
+      "min_distance": 0.266,
+      "max_distance": 0.40,
     },
   )
   cfg.rewards["knee_distance_lateral"] = RewardTermCfg(
     func=wbc_rewards.knee_distance_lateral,
-    weight=3.0,
+    weight=3,
     params={
       "asset_cfg": _knee_body_asset(),
-      "min_distance": 0.265,
-      "max_distance": 0.35,
+      "min_distance": 0.279,
+      "max_distance": 0.32,
     },
   )
   cfg.rewards["flat_foot"] = RewardTermCfg(
     func=wbc_rewards.flat_foot,
-    weight=-0.1,
+    weight=-1,
     params={
       "sensor_name": "feet_ground_contact",
       "asset_cfg": _feet_body_asset(),
@@ -525,7 +572,11 @@ def _apply_twist_ranges(cfg: ManagerBasedRlEnvCfg) -> None:
     heading_control_stiffness=base_twist_cmd.heading_control_stiffness,
     rel_standing_envs=base_twist_cmd.rel_standing_envs,
     rel_turning_envs=0.2,
-    rel_heading_envs=base_twist_cmd.rel_heading_envs,
+    rel_startup_envs=0.1,
+    startup_standing_time_range=(2.0, 3.0),
+    startup_walking_time_range=(3.0, 4.0),
+    startup_speed_range=(0.3, 0.6),
+    rel_heading_envs=0.2,
     rel_world_envs=base_twist_cmd.rel_world_envs,
     rel_forward_envs=base_twist_cmd.rel_forward_envs,
     init_velocity_prob=base_twist_cmd.init_velocity_prob,
@@ -540,16 +591,29 @@ def _apply_twist_ranges(cfg: ManagerBasedRlEnvCfg) -> None:
   )
   cfg.commands["twist"] = twist_cmd
 
-  # Mirror G1's half-speed warmup, while keeping vy disabled in both stages.
+  # Expand only the translation range in four stages.  The existing wz
+  # schedule (half range until 5000 iterations, then full range) is unchanged.
   cfg.curriculum["command_vel"].params["velocity_stages"] = [
     {
       "step": 0,
-      "lin_vel_x": (vx[0] * 0.5, vx[1] * 0.5),
+      "lin_vel_x": (-0.30, 0.30),
+      "lin_vel_y": vy,
+      "ang_vel_z": (wz[0] * 0.5, wz[1] * 0.5),
+    },
+    {
+      "step": 2500 * 24,
+      "lin_vel_x": (-0.50, 0.50),
       "lin_vel_y": vy,
       "ang_vel_z": (wz[0] * 0.5, wz[1] * 0.5),
     },
     {
       "step": 5000 * 24,
+      "lin_vel_x": (-0.80, 0.80),
+      "lin_vel_y": vy,
+      "ang_vel_z": wz,
+    },
+    {
+      "step": 8000 * 24,
       "lin_vel_x": vx,
       "lin_vel_y": vy,
       "ang_vel_z": wz,
