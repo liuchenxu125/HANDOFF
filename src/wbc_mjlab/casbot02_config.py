@@ -440,16 +440,14 @@ def _apply_loco_rewards(cfg: ManagerBasedRlEnvCfg) -> None:
   # dof_torques_l2: τ² penalty restricted to ankle pitch (leg_[lr]5). Roll peaks
   #   stay well inside the 80 Nm clamp in sim2sim, so only pitch is penalized.
   # torque_limits: (|τ| - 0.8·τ_max)²_+ over ankle pitch only (leg_[lr]5).
-  #   Roll/hip/arm actuators stay well inside their effort limits in sim2sim,
-  #   so only ankle pitch (the joint that approaches its 80 Nm clamp) is gated.
-  cfg.rewards["dof_torques_l2"] = RewardTermCfg(
-    func=wbc_rewards.joint_torques_l2,
-    weight=-3e-6,
-    params={
-      "asset_cfg": _leg_actuator_asset(),
-      "joint_weights": _ANKLE_PITCH_JOINT_WEIGHTS,
-    },
-  )
+  # cfg.rewards["dof_torques_l2"] = RewardTermCfg(
+  #   func=wbc_rewards.joint_torques_l2,
+  #   weight=-3e-6,
+  #   params={
+  #     "asset_cfg": _leg_actuator_asset(),
+  #     "joint_weights": _ANKLE_PITCH_JOINT_WEIGHTS,
+  #   },
+  # )
   cfg.rewards["torque_limits"] = RewardTermCfg(
     func=wbc_rewards.applied_torque_limits_by_ratio,
     weight=-0.01,

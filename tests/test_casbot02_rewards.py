@@ -25,15 +25,21 @@ class Casbot02TorqueEnergyRewardTest(unittest.TestCase):
     # joint_energy is currently disabled (commented out) in the loco config.
     self.assertNotIn("joint_energy", cfg.rewards)
     # dof_torques_l2: ankle-pitch only (weight is tuned by hand, just check sign).
-    self.assertIn("dof_torques_l2", cfg.rewards)
-    self.assertLess(cfg.rewards["dof_torques_l2"].weight, 0.0)
-    self.assertEqual(
-      cfg.rewards["dof_torques_l2"].params["joint_weights"],
-      _ANKLE_PITCH_JOINT_WEIGHTS,
-    )
-    # torque_limits: all actuators, 0.8 ratio.
+    # Currently disabled (commented out) in the loco config; when re-enabled,
+    # it must target only ankle pitch via _ANKLE_PITCH_JOINT_WEIGHTS.
+    if "dof_torques_l2" in cfg.rewards:
+      self.assertLess(cfg.rewards["dof_torques_l2"].weight, 0.0)
+      self.assertEqual(
+        cfg.rewards["dof_torques_l2"].params["joint_weights"],
+        _ANKLE_PITCH_JOINT_WEIGHTS,
+      )
+    # torque_limits: ankle pitch only (leg_[lr]5), 0.8 ratio.
     self.assertEqual(cfg.rewards["torque_limits"].weight, -0.01)
     self.assertEqual(cfg.rewards["torque_limits"].params["limit_ratio"], 0.8)
+    self.assertEqual(
+      list(cfg.rewards["torque_limits"].params["asset_cfg"].actuator_names),
+      ["leg_l5_joint", "leg_r5_joint"],
+    )
     # feet_air_time: G1/HANDOFF landing-time reward gated by twist command.
     # Currently disabled (commented out) in the loco config; when re-enabled,
     # target=None means reward any lift proportional to air time (no cap).
