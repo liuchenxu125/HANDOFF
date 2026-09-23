@@ -55,6 +55,24 @@ def _leg_actuator_asset() -> SceneEntityCfg:
   )
 
 
+def _leg_joint_and_actuator_asset() -> SceneEntityCfg:
+  """12 policy-controlled legs for joint-velocity × actuator-force terms."""
+  return SceneEntityCfg(
+    "robot",
+    joint_names=C.CASBOT02_LEG_ONLY_JOINT_NAMES,
+    actuator_names=C.CASBOT02_LEG_ONLY_JOINT_NAMES,
+    preserve_order=True,
+  )
+
+
+# 1 on ankle pitch (l5/r5); 0 on roll (l6/r6) and the other ten leg joints.
+# Sim2sim logs only saturate pitch at the 80 Nm clamp; roll peaks ~47–53 Nm.
+_ANKLE_PITCH_JOINT_WEIGHTS: tuple[float, ...] = tuple(
+  1.0 if name in ("leg_l5_joint", "leg_r5_joint") else 0.0
+  for name in C.CASBOT02_LEG_ONLY_JOINT_NAMES
+)
+
+
 def _torso_asset() -> SceneEntityCfg:
   return SceneEntityCfg("robot", body_names=("torso",))
 
@@ -219,62 +237,61 @@ def _apply_loco_rewards(cfg: ManagerBasedRlEnvCfg) -> None:
 
   # 用每只脚的当前腾空时间作为摆动进度，跟踪半正弦高度曲线。
   # AMP 前进数据：左/右峰值 11.6/11.4 cm，摆动时间 0.55/0.59 s。
+  # G1-style foot_clearance with a turn split: penalize |foot_height - target|
+  # weighted by foot horizontal velocity. No time-curve template, so swing
+  # duration and horizontal foot reach stay free to scale with command speed.
+  # Straight walking targets 8 cm; pure in-place turns target 5 cm (lower lift).
   cfg.rewards.pop("foot_clearance", None)
   cfg.rewards["swing_height_curve"] = RewardTermCfg(
-    func=wbc_rewards.command_conditioned_swing_height_curve,
-    weight=-3.0,
+    func=wbc_rewards.command_conditioned_feet_clearance,
+    weight=-6.0,
     params={
-      "sensor_name": "feet_ground_contact",
       "height_sensor_name": "foot_height_scan",
-      # Straight walking retains the tuned forward-data curve.  The pure-turn
-      # curve comes from 原地左转/右转.npz: ~6.4-6.7 cm and ~0.40 s.
-      "translation_peak_height": (0.128, 0.128),
-      "turning_peak_height": (0.065, 0.065),
-      "translation_swing_time": (0.585, 0.585),
-      "turning_swing_time": (0.40, 0.40),
+      "translation_target_height": 0.05,
+      "turning_target_height": 0.05,
       "command_name": "twist",
-      "command_threshold": 0.2,
+      "command_threshold": 0.05,
       "turning_linear_threshold": 0.2,
       "turning_angular_threshold": 0.2,
+      "asset_cfg": _feet_site_asset(),
     },
   )
 
-  # 落地峰值必须使用同一套运动模式门控，否则原始 0.12 m 目标仍会
-  # 在背后把原地转弯脚拉高。
+  # foot_swing_height with a turn split (no time curve): penalize
+  # (peak/target - 1)^2 at first contact. Straight walking targets 12 cm;
+  # pure in-place turns target 7 cm (lower peak, appropriate for lateral steps).
   cfg.rewards["foot_swing_height"] = RewardTermCfg(
     func=wbc_rewards.command_conditioned_feet_swing_height,
-    weight=-0.25,
+    weight=-0.75,
     params={
       "sensor_name": "feet_ground_contact",
       "height_sensor_name": "foot_height_scan",
-      "translation_target_height": 0.128,
-      "turning_target_height": 0.065,
+      "translation_target_height": 0.08,
+      "turning_target_height": 0.08,
       "command_name": "twist",
       "command_threshold": 0.05,
       "turning_linear_threshold": 0.2,
       "turning_angular_threshold": 0.2,
     },
   )
-  cfg.rewards["foot_slip"].weight = -0.1
+  cfg.rewards["foot_slip"].weight = -1.0
   cfg.rewards["foot_slip"].params["asset_cfg"] = _feet_site_asset()
-  cfg.rewards["soft_landing"].weight = -6e-3
+  cfg.rewards["soft_landing"].weight = -4e-3
 
-  # 保留密集 air_time 信号：直行窗口保持 0.05~0.60 s，纯转弯缩短为
-  # 0.05~0.42 s；高度曲线分别在 0.59/0.40 s 回到零。
-  cfg.rewards["air_time"] = RewardTermCfg(
-    func=wbc_rewards.command_conditioned_feet_air_time,
-    weight=1.0,
-    params={
-      "sensor_name": "feet_ground_contact",
-      "threshold_min": 0.05,
-      "translation_threshold_max": 0.60,
-      "turning_threshold_max": 0.42,
-      "command_name": "twist",
-      "command_threshold": 0.2,
-      "turning_linear_threshold": 0.2,
-      "turning_angular_threshold": 0.2,
-    },
-  )
+  # G1/HANDOFF feet_air_time: at landing, penalize (target - last_air_time) so
+  # air time is pushed toward 0.5 s. This actively drives longer strides (and
+  # thus step length scaling with speed), unlike the binary-count air_time.
+  # Casbot02 has no motion command, so gate on the twist command magnitude.
+  cfg.rewards.pop("air_time", None)
+  # cfg.rewards["feet_air_time"] = RewardTermCfg(
+  #   func=wbc_rewards.feet_air_time,
+  #   weight=0.5,
+  #   params={
+  #     "sensor_name": "feet_ground_contact",
+  #     "uniform_cmd_name": "twist",
+  #     "feet_air_time_target": None,
+  #   },
+  # )
 
   # Per-robot wiring: root/torso bodies + leg joints.
   cfg.rewards["track_linear_velocity"].params["asset_cfg"] = _torso_asset()
@@ -285,27 +302,30 @@ def _apply_loco_rewards(cfg: ManagerBasedRlEnvCfg) -> None:
   cfg.rewards["pose"].weight = 1.0
   cfg.rewards["pose"].params["asset_cfg"] = _leg_asset()
   cfg.rewards["pose"].params["std_standing"] = {".*": 0.05}
+  # Match G1 walking/running pose tightness on a per-joint relative scale:
+  # std *= min_room_casbot / min_room_g1, where min_room is the distance from
+  # the default pose to the nearest joint limit (hip-roll adduction, etc.).
   cfg.rewards["pose"].params["std_walking"] = {
-    r"leg_[lr]1_joint": 0.3,   # hip pitch
-    r"leg_[lr]2_joint": 0.15,  # hip roll
-    r"leg_[lr]3_joint": 0.15,  # hip yaw
-    r"leg_[lr]4_joint": 0.35,  # knee
-    r"leg_[lr]5_joint": 0.25,  # ankle pitch
-    r"leg_[lr]6_joint": 0.1,   # ankle roll
+    r"leg_[lr]1_joint": 0.30,   # hip pitch  0.30 * 1.73/2.43
+    r"leg_[lr]2_joint": 0.05,   # hip roll   0.15 * 0.175/0.524
+    r"leg_[lr]3_joint": 0.15,  # hip yaw    0.15 * 1.57/2.76
+    r"leg_[lr]4_joint": 0.35,   # knee       0.35 * 0.36/0.387
+    r"leg_[lr]5_joint": 0.25,   # ankle pitch ~same travel as G1
+    r"leg_[lr]6_joint": 0.10,   # ankle roll 0.10 * 0.506/0.262
   }
   cfg.rewards["pose"].params["std_running"] = {
-    r"leg_[lr]1_joint": 0.5,   # hip pitch
-    r"leg_[lr]2_joint": 0.2,   # hip roll
-    r"leg_[lr]3_joint": 0.2,   # hip yaw
-    r"leg_[lr]4_joint": 0.6,   # knee
-    r"leg_[lr]5_joint": 0.35,  # ankle pitch
-    r"leg_[lr]6_joint": 0.15,  # ankle roll
+    r"leg_[lr]1_joint": 0.36,   # hip pitch  0.50 * 1.73/2.43
+    r"leg_[lr]2_joint": 0.07,   # hip roll   0.20 * 0.175/0.524
+    r"leg_[lr]3_joint": 0.11,   # hip yaw    0.20 * 1.57/2.76
+    r"leg_[lr]4_joint": 0.56,   # knee       0.60 * 0.36/0.387
+    r"leg_[lr]5_joint": 0.35,   # ankle pitch ~same travel as G1
+    r"leg_[lr]6_joint": 0.29,   # ankle roll 0.15 * 0.506/0.262
   }
   # Match G1's dedicated zero-command posture penalty, but constrain only the
   # 12 policy-controlled leg joints (the arms follow the deterministic swing).
   cfg.rewards["stand_pose"] = RewardTermCfg(
     func=wbc_rewards.stand_pose,
-    weight=-4.0,
+    weight=-5.0,
     params={
       "command_name": "twist",
       "asset_cfg": _leg_asset(),
@@ -322,38 +342,63 @@ def _apply_loco_rewards(cfg: ManagerBasedRlEnvCfg) -> None:
   #     "asset_cfg": _feet_site_asset(),
   #   },
   # )
-  # Casbot02 nominal sole-center spacing is 0.285 m.  Allow 0.027 m inward
+  # Casbot02 nominal sole-center spacing is 0.285 m.  Allow 0.020 m inward
   # motion while leaving extra outward room for turning.  Positive weight is
   # intentional: the reward function returns a negative error outside this band.
   cfg.rewards["feet_distance_lateral"] = RewardTermCfg(
     func=wbc_rewards.feet_distance_lateral,
-    weight=3.0,
+    weight=1,
     params={
       "asset_cfg": _feet_site_asset(),
       "min_distance": 0.265,
-      "max_distance": 0.35,
+      "max_distance": 0.42,
     },
   )
   cfg.rewards["knee_distance_lateral"] = RewardTermCfg(
     func=wbc_rewards.knee_distance_lateral,
-    weight=3.0,
+    weight=2.0,
     params={
       "asset_cfg": _knee_body_asset(),
       "min_distance": 0.265,
-      "max_distance": 0.35,
+      "max_distance": 0.42,
     },
   )
   cfg.rewards["flat_foot"] = RewardTermCfg(
     func=wbc_rewards.flat_foot,
-    weight=-0.1,
+    weight=-1.0,
     params={
       "sensor_name": "feet_ground_contact",
       "asset_cfg": _feet_body_asset(),
     },
   )
-  cfg.rewards["body_ang_vel"].weight = -0.05
-  cfg.rewards["body_ang_vel"].params["asset_cfg"] = _torso_asset()
-  cfg.rewards["angular_momentum"].weight = -0.02
+  # Hold the foot flat during swing too. flat_foot only fires in stance, so a
+  # free high swing arc + compliant ankle let the foot rotate into heel-strike
+  # (forward) / toe-lift (backward) before landing. This mirrors flat_foot but
+  # gates on the airborne phase, preventing the pronounced heel-then-toe gait.
+  cfg.rewards["swing_foot_orientation"] = RewardTermCfg(
+    func=wbc_rewards.swing_foot_orientation,
+    weight=-0.5,
+    params={
+      "sensor_name": "feet_ground_contact",
+      "asset_cfg": _feet_body_asset(),
+    },
+  )
+  # cfg.rewards["body_ang_vel"].weight = -0.05
+  # cfg.rewards["body_ang_vel"].params["asset_cfg"] = _torso_asset()
+  # cfg.rewards["angular_momentum"].weight = -0.02
+  # G1 loco teacher whole-body momentum-change penalties (jerk, not magnitude).
+  # Penalize the rate of change of linear/angular momentum so turning is not
+  # over-penalized (only sudden changes are). Aligned with G1's stable variant.
+  cfg.rewards["linear_momentum_change"] = RewardTermCfg(
+    func=wbc_rewards.LinearMomentumChangePenalty,
+    weight=1e-6,
+    params={},
+  )
+  cfg.rewards["angular_momentum_change"] = RewardTermCfg(
+    func=wbc_rewards.AngularMomentumChangePenalty,
+    weight=1e-5,
+    params={},
+  )
   # Added after the 2026-09-02 reference run; keep disabled while reproducing
   # that policy's reward configuration.
   # cfg.rewards["straight_hip_yaw_pos_l2"] = RewardTermCfg(
@@ -391,32 +436,36 @@ def _apply_loco_rewards(cfg: ManagerBasedRlEnvCfg) -> None:
   #     "yaw_relax_end": 0.4,
   #   },
   # )
-  # cfg.rewards["leg_torques_l2"] = RewardTermCfg(
-  #   func=env_mdp.joint_torques_l2,
-  #   weight=-5.0e-6,
-  #   params={"asset_cfg": _leg_actuator_asset()},
-  # )
-  # Suppress persistent hip-roll closed-chain internal torques without
-  # penalizing the other ten policy-controlled leg actuators.
-  # cfg.rewards["hip_roll_torques_l2"] = RewardTermCfg(
-  #   func=env_mdp.joint_torques_l2,
-  #   weight=-5.0e-6,
+  # InstinctLab parkour torque terms, ported to mjlab.
+  # dof_torques_l2: τ² penalty restricted to ankle pitch (leg_[lr]5). Roll peaks
+  #   stay well inside the 80 Nm clamp in sim2sim, so only pitch is penalized.
+  # torque_limits: (|τ| - 0.8·τ_max)²_+ over ankle pitch only (leg_[lr]5).
+  #   Roll/hip/arm actuators stay well inside their effort limits in sim2sim,
+  #   so only ankle pitch (the joint that approaches its 80 Nm clamp) is gated.
+  cfg.rewards["dof_torques_l2"] = RewardTermCfg(
+    func=wbc_rewards.joint_torques_l2,
+    weight=-3e-6,
+    params={
+      "asset_cfg": _leg_actuator_asset(),
+      "joint_weights": _ANKLE_PITCH_JOINT_WEIGHTS,
+    },
+  )
+  cfg.rewards["torque_limits"] = RewardTermCfg(
+    func=wbc_rewards.applied_torque_limits_by_ratio,
+    weight=-0.01,
+    params={
+      "asset_cfg": SceneEntityCfg(
+        "robot", actuator_names=["leg_l5_joint", "leg_r5_joint"]
+      ),
+      "limit_ratio": 0.8,
+    },
+  )
+  # cfg.rewards["joint_energy"] = RewardTermCfg(
+  #   func=wbc_rewards.joint_energy,
+  #   weight=-1.0e-4,
   #   params={
-  #     "asset_cfg": SceneEntityCfg(
-  #       "robot",
-  #       actuator_names=("leg_l2_joint", "leg_r2_joint"),
-  #       preserve_order=True,
-  #     )
-  #   },
-  # )
-  # Penalize only the part of actuator effort above 80% of its physical limit.
-  # At the measured 0.5 m/s gait this primarily targets ankle-pitch saturation.
-  # cfg.rewards["dof_torque_limits"] = RewardTermCfg(
-  #   func=wbc_rewards.dof_torque_limits,
-  #   weight=-1,
-  #   params={
-  #     "asset_cfg": SceneEntityCfg("robot", actuator_names=(".*",)),
-  #     "soft_torque_limit": 0.8,
+  #     "asset_cfg": _leg_joint_and_actuator_asset(),
+  #     "joint_weights": _ANKLE_PITCH_JOINT_WEIGHTS,
   #   },
   # )
   cfg.rewards["self_collisions"] = RewardTermCfg(
@@ -525,9 +574,13 @@ def _apply_twist_ranges(cfg: ManagerBasedRlEnvCfg) -> None:
     heading_control_stiffness=base_twist_cmd.heading_control_stiffness,
     rel_standing_envs=base_twist_cmd.rel_standing_envs,
     rel_turning_envs=0.2,
-    rel_heading_envs=base_twist_cmd.rel_heading_envs,
+    rel_startup_envs=0.1,
+    startup_standing_time_range=(2.0, 3.0),
+    startup_walking_time_range=(3.0, 4.0),
+    startup_speed_range=(0.3, 0.6),
+    rel_heading_envs=0.2,
     rel_world_envs=base_twist_cmd.rel_world_envs,
-    rel_forward_envs=base_twist_cmd.rel_forward_envs,
+    rel_forward_envs=0.2,
     init_velocity_prob=base_twist_cmd.init_velocity_prob,
     min_turning_ang_vel=0.2,
     ranges=Casbot02VelocityCommandCfg.Ranges(
@@ -540,16 +593,29 @@ def _apply_twist_ranges(cfg: ManagerBasedRlEnvCfg) -> None:
   )
   cfg.commands["twist"] = twist_cmd
 
-  # Mirror G1's half-speed warmup, while keeping vy disabled in both stages.
+  # Expand only the translation range in four stages.  The existing wz
+  # schedule (half range until 5000 iterations, then full range) is unchanged.
   cfg.curriculum["command_vel"].params["velocity_stages"] = [
     {
       "step": 0,
-      "lin_vel_x": (vx[0] * 0.5, vx[1] * 0.5),
+      "lin_vel_x": (-0.30, 0.30),
+      "lin_vel_y": vy,
+      "ang_vel_z": (wz[0] * 0.5, wz[1] * 0.5),
+    },
+    {
+      "step": 2500 * 24,
+      "lin_vel_x": (-0.50, 0.50),
       "lin_vel_y": vy,
       "ang_vel_z": (wz[0] * 0.5, wz[1] * 0.5),
     },
     {
       "step": 5000 * 24,
+      "lin_vel_x": (-0.80, 0.80),
+      "lin_vel_y": vy,
+      "ang_vel_z": wz,
+    },
+    {
+      "step": 8000 * 24,
       "lin_vel_x": vx,
       "lin_vel_y": vy,
       "ang_vel_z": wz,

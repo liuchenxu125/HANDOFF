@@ -1115,6 +1115,54 @@ class command_conditioned_feet_swing_height:
       self.peak_heights[env_ids] = 0.0
 
 
+def command_conditioned_feet_clearance(
+  env: ManagerBasedRlEnv,
+  height_sensor_name: str,
+  translation_target_height: float,
+  turning_target_height: float,
+  command_name: str = "twist",
+  command_threshold: float = 0.05,
+  turning_linear_threshold: float = 0.2,
+  turning_angular_threshold: float = 0.2,
+  asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+  """feet_clearance with a turn-blend-interpolated target height.
+
+  Straight walking uses ``translation_target_height``; pure in-place turns use
+  the lower ``turning_target_height``. Like G1's feet_clearance this penalizes
+  |foot_height - target| weighted by foot horizontal velocity, with NO
+  time-curve template (swing duration and horizontal reach stay free).
+  """
+  asset = _get_robot(env, asset_cfg)
+  height_sensor = env.scene[height_sensor_name]
+  assert isinstance(height_sensor, TerrainHeightSensor), (
+    "command_conditioned_feet_clearance requires a TerrainHeightSensor, "
+    f"got {type(height_sensor).__name__}"
+  )
+  foot_height = height_sensor.data.heights  # [B, F]
+  foot_vel_xy = asset.data.site_lin_vel_w[:, asset_cfg.site_ids, :2]  # [B, F, 2]
+  vel_norm = torch.norm(foot_vel_xy, dim=-1)  # [B, F]
+
+  command = env.command_manager.get_command(command_name)
+  assert command is not None
+  turn_blend = command_turning_blend(
+    command,
+    turning_linear_threshold=turning_linear_threshold,
+    turning_angular_threshold=turning_angular_threshold,
+  )
+  target_height = torch.lerp(
+    torch.full_like(turn_blend, translation_target_height),
+    torch.full_like(turn_blend, turning_target_height),
+    turn_blend,
+  ).unsqueeze(1)  # [B, 1]
+  delta = torch.abs(foot_height - target_height)
+  cost = torch.sum(delta * vel_norm, dim=1)
+  linear_norm = torch.norm(command[:, :2], dim=1)
+  angular_norm = torch.abs(command[:, 2])
+  active = (linear_norm + angular_norm > command_threshold).float()
+  return cost * active
+
+
 def command_conditioned_feet_air_time(
   env: ManagerBasedRlEnv,
   sensor_name: str,
@@ -1235,6 +1283,40 @@ def flat_foot(
   ).reshape(env.num_envs, len(asset_cfg.body_ids), 3)
   tilt_error = torch.sum(torch.square(projected[..., :2]), dim=-1)
   return torch.sum(tilt_error * contact, dim=-1)
+
+
+def swing_foot_orientation(
+  env: ManagerBasedRlEnv,
+  sensor_name: str,
+  asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+  contact_force_threshold: float = 1.0,
+) -> torch.Tensor:
+  """Penalize foot tilt during swing (airborne).
+
+  ``flat_foot`` only acts in stance (gated by contact), so the swing phase is
+  free and a high/free swing arc plus a compliant ankle lets the foot rotate
+  into heel-strike (forward) or toe-lift (backward) before landing. This term
+  mirrors ``flat_foot`` but gates on ``1 - contact`` so the foot is held flat
+  across the whole gait cycle. Standing contributes zero (feet in contact).
+  """
+  asset = _get_robot(env, asset_cfg)
+  sensor: ContactSensor = env.scene[sensor_name]
+  force = sensor.data.force
+  assert force is not None
+  airborne = (
+    torch.norm(force[..., :3], dim=-1) <= contact_force_threshold
+  ).float()
+  foot_quat = asset.data.body_link_quat_w[:, asset_cfg.body_ids, :]
+  gravity = _expand_gravity_for_bodies(
+    asset.data.gravity_vec_w,
+    num_envs=env.num_envs,
+    num_bodies=foot_quat.shape[1],
+  )
+  projected = quat_apply_inverse(
+    foot_quat.reshape(-1, 4), gravity.reshape(-1, 3)
+  ).reshape(env.num_envs, len(asset_cfg.body_ids), 3)
+  tilt_error = torch.sum(torch.square(projected[..., :2]), dim=-1)
+  return torch.sum(tilt_error * airborne, dim=-1)
 
 
 def gait_phase_contact(
@@ -1509,12 +1591,18 @@ class straight_non_sagittal_target_deviation_l2:
 
 
 class dof_torque_limits:
-  """HANDOFF normalized actuator-force-over-limit penalty."""
+  """HANDOFF normalized actuator-force-over-limit penalty.
+
+  By default the cap is the simulation ``actuator_forcerange``. Pass
+  ``effort_limit`` (Nm) to use a hardware / URDF rating instead, so a
+  softer sim motor cannot hide real-robot saturation.
+  """
 
   def __init__(self, cfg: RewardTermCfg, env: ManagerBasedRlEnv):
     self._asset_cfg: SceneEntityCfg = cfg.params.get("asset_cfg", _DEFAULT_ASSET_CFG)
     asset = _get_robot(env, self._asset_cfg)
-    actuator_ids = asset.find_actuators((".*",), preserve_order=True)[0]
+    names = self._asset_cfg.actuator_names or (".*",)
+    actuator_ids = asset.find_actuators(names, preserve_order=True)[0]
     self._actuator_ids = torch.tensor(
       actuator_ids, device=env.device, dtype=torch.long
     )
@@ -1524,18 +1612,93 @@ class dof_torque_limits:
     env: ManagerBasedRlEnv,
     soft_torque_limit: float = 0.95,
     asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+    effort_limit: float | None = None,
   ) -> torch.Tensor:
     del asset_cfg
     asset = _get_robot(env, self._asset_cfg)
     actuator_force = torch.abs(asset.data.actuator_force[:, self._actuator_ids])
-    force_range = env.sim.model.actuator_forcerange
-    if force_range.ndim == 2:
-      max_force = force_range[self._actuator_ids, 1].unsqueeze(0)
+    if effort_limit is not None:
+      max_force = actuator_force.new_full((1, actuator_force.shape[1]), effort_limit)
     else:
-      max_force = force_range[:, self._actuator_ids, 1]
+      force_range = env.sim.model.actuator_forcerange
+      if force_range.ndim == 2:
+        max_force = force_range[self._actuator_ids, 1].unsqueeze(0)
+      else:
+        max_force = force_range[:, self._actuator_ids, 1]
     max_force = torch.clamp(max_force, min=1.0e-6)
     over_limit = torch.clamp(actuator_force / max_force - soft_torque_limit, min=0.0)
     return torch.sum(over_limit, dim=1)
+
+
+def _joint_term_weights(
+  joint_weights: tuple[float, ...] | None,
+  num_joints: int,
+  device: torch.device,
+  dtype: torch.dtype,
+) -> torch.Tensor | None:
+  if joint_weights is None:
+    return None
+  if len(joint_weights) != num_joints:
+    raise ValueError(
+      f"joint_weights has {len(joint_weights)} entries, expected {num_joints}"
+    )
+  return torch.as_tensor(joint_weights, device=device, dtype=dtype)
+
+
+def joint_torques_l2(
+  env: ManagerBasedRlEnv,
+  asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+  joint_weights: tuple[float, ...] | None = None,
+) -> torch.Tensor:
+  """Penalize Σ w_i τ_i². ``joint_weights`` is per selected actuator."""
+  asset = _get_robot(env, asset_cfg)
+  tau = asset.data.actuator_force[:, asset_cfg.actuator_ids]
+  cost = torch.square(tau)
+  weights = _joint_term_weights(joint_weights, cost.shape[1], cost.device, cost.dtype)
+  if weights is not None:
+    cost = cost * weights
+  return torch.sum(cost, dim=1)
+
+
+def joint_energy(
+  env: ManagerBasedRlEnv,
+  asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+  joint_weights: tuple[float, ...] | None = None,
+) -> torch.Tensor:
+  """Penalize Σ w_i |q̇_i| |τ_i|, matching roboparty_train."""
+  asset = _get_robot(env, asset_cfg)
+  qvel = asset.data.joint_vel[:, asset_cfg.joint_ids]
+  qfrc = asset.data.actuator_force[:, asset_cfg.actuator_ids]
+  cost = torch.abs(qvel) * torch.abs(qfrc)
+  weights = _joint_term_weights(joint_weights, cost.shape[1], cost.device, cost.dtype)
+  if weights is not None:
+    cost = cost * weights
+  return torch.sum(cost, dim=-1)
+
+
+def applied_torque_limits_by_ratio(
+  env: ManagerBasedRlEnv,
+  asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+  limit_ratio: float = 0.8,
+) -> torch.Tensor:
+  """Penalize Σ (|τ| - ratio·τ_max)²_+ over selected actuators.
+
+  Ported from InstinctLab parkour (``mdp.applied_torque_limits_by_ratio``).
+  mjlab has no ``applied_torque`` / ``joint_effort_limits`` fields, so the
+  actuator-force output stands in for the applied torque and the simulation
+  ``actuator_forcerange`` upper bound stands in for the per-actuator effort
+  limit. Only the excess above ``limit_ratio`` of the limit is penalized.
+  """
+  asset = _get_robot(env, asset_cfg)
+  applied_torque = torch.abs(asset.data.actuator_force[:, asset_cfg.actuator_ids])
+  force_range = env.sim.model.actuator_forcerange
+  if force_range.ndim == 2:
+    max_force = force_range[asset_cfg.actuator_ids, 1]
+  else:
+    max_force = force_range[:, asset_cfg.actuator_ids, 1]
+  max_force = torch.clamp(max_force, min=1.0e-6)
+  out_of_limits = torch.clamp(applied_torque - max_force * limit_ratio, min=0.0)
+  return torch.sum(torch.square(out_of_limits), dim=-1)
 
 
 class ankle_dof_acc:
@@ -1588,14 +1751,20 @@ class feet_air_time:
     env: ManagerBasedRlEnv,
     sensor_name: str,
     command_name: str = "motion",
-    feet_air_time_target: float = 0.5,
+    feet_air_time_target: float | None = 0.5,
     uniform_cmd_name: str | None = None,
   ) -> torch.Tensor:
     sensor: ContactSensor = env.scene[sensor_name]
     last_air_time = sensor.data.last_air_time
     assert last_air_time is not None
     first_contact = sensor.compute_first_contact(dt=self.step_dt).float()
-    air_time = torch.clamp(last_air_time - feet_air_time_target, max=0.0)
+    if feet_air_time_target is None:
+      # No target: reward any lift proportional to its air time (longer stride
+      # = more reward), no upper cap. Encourages step length to scale with speed.
+      air_time = last_air_time
+    else:
+      # Penalize shortfall below the target at landing (drives air time -> target).
+      air_time = torch.clamp(last_air_time - feet_air_time_target, max=0.0)
     reward = torch.sum(air_time * first_contact, dim=1)
     if uniform_cmd_name is not None:
       uni_xy = env_mdp.generated_commands(env, command_name=uniform_cmd_name)[:, :2]
@@ -1774,8 +1943,6 @@ def motion_soft_landing(
 # ---------------------------------------------------------------------------
 # CBF reward (additive — attached only in the CBF task variant)
 # ---------------------------------------------------------------------------
-
-
 
 
 

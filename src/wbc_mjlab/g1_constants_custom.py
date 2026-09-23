@@ -838,18 +838,18 @@ DEFAULT_RIGHT_HAND_OFFSET = np.array([0.12, 0.0, 0.02], dtype=np.float32)
 
 
 def _build_nominal_command() -> np.ndarray:
-  from deploy.common.command import (
-    CMD_HEIGHT,
-    CMD_LEFT_HAND,
-    CMD_RIGHT_HAND,
-    CMD_SIZE,
-  )
+  # Keep schema indices local so ``import wbc_mjlab`` works without putting
+  # the repo root on PYTHONPATH. Values match deploy/common/command.py.
+  cmd_height = 3
+  cmd_left_hand = 4
+  cmd_right_hand = 7
+  cmd_size = 18
 
-  cmd = np.zeros(CMD_SIZE, dtype=np.float32)
+  cmd = np.zeros(cmd_size, dtype=np.float32)
   # TODO update this to match the walking pose for easier transitions
-  cmd[CMD_HEIGHT] = 0.78
-  cmd[CMD_LEFT_HAND:CMD_LEFT_HAND + 3] = NOMINAL_LEFT_HAND_BODY + DEFAULT_LEFT_HAND_OFFSET
-  cmd[CMD_RIGHT_HAND:CMD_RIGHT_HAND + 3] = NOMINAL_RIGHT_HAND_BODY + DEFAULT_RIGHT_HAND_OFFSET
+  cmd[cmd_height] = 0.78
+  cmd[cmd_left_hand:cmd_left_hand + 3] = NOMINAL_LEFT_HAND_BODY + DEFAULT_LEFT_HAND_OFFSET
+  cmd[cmd_right_hand:cmd_right_hand + 3] = NOMINAL_RIGHT_HAND_BODY + DEFAULT_RIGHT_HAND_OFFSET
   return cmd
 
 

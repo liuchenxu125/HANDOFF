@@ -326,7 +326,7 @@ LEG_HEAVY_ACTUATOR = BuiltinPositionActuatorCfg(
   ),
   stiffness=_stiffness(0.07),
   damping=_damping(0.07),
-  effort_limit=120.0,
+  effort_limit=150.0,
   armature=0.07,
   frictionloss=0.01,
 )
@@ -342,7 +342,7 @@ LEG_LIGHT_ACTUATOR = BuiltinPositionActuatorCfg(
   ),
   stiffness=_stiffness(0.029),
   damping=_damping(0.029),
-  effort_limit=80.0,
+  effort_limit=120.0,
   armature=0.029,
   frictionloss=0.01,
 )

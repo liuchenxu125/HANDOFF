@@ -20,13 +20,36 @@ from wbc_mjlab.g1_constants_custom import (
 )
 from wbc_mjlab.pkl_motion_lib import PklMotionLib
 
+# Same contralateral mapping as Casbot02: Δq_shoulder = ±gain * (q_knee_L - q_knee_R).
+ARM_SWING_GAIN = 0.5
+G1_LEFT_KNEE_NAME = "left_knee_joint"
+G1_RIGHT_KNEE_NAME = "right_knee_joint"
+G1_LEFT_SHOULDER_PITCH_NAME = "left_shoulder_pitch_joint"
+G1_RIGHT_SHOULDER_PITCH_NAME = "right_shoulder_pitch_joint"
+
+
+def knee_diff_shoulder_offsets(
+  left_knee: torch.Tensor,
+  right_knee: torch.Tensor,
+  gain: float = ARM_SWING_GAIN,
+) -> tuple[torch.Tensor, torch.Tensor]:
+  """Left/right shoulder-pitch offsets from measured knee difference."""
+  knee_diff = left_knee - right_knee
+  return gain * knee_diff, -gain * knee_diff
+
 
 @dataclass(kw_only=True)
 class G1LocoTeacherActionCfg(ActionTermCfg):
-  """15-DoF locomotion teacher action term with motion-driven arms."""
+  """15-DoF locomotion teacher action term.
+
+  ``arm_mode="knee_swing"`` holds unused arm joints at default and maps
+  shoulder pitch from the measured knee difference (Casbot02 formula).
+  ``arm_mode="motion"`` keeps the original mocap-driven arm curriculum.
+  """
 
   body_joint_names: tuple[str, ...]
   arm_joint_names: tuple[str, ...]
+  arm_mode: str = "knee_swing"
   motion_file: str | None = None
   motion_command_name: str = "motion"
   motion_body_names: tuple[str, ...] = ("torso_link",)
@@ -84,7 +107,20 @@ class G1LocoTeacherAction(ActionTerm):
     self._clip = self._resolve_clip(cfg.clip, self._body_joint_names)
 
     self._arm_blend_factor = float(cfg.init_blend)
-    if cfg.arms_from_motion_command:
+    if cfg.arm_mode not in ("knee_swing", "motion"):
+      raise ValueError(f"Unknown arm_mode {cfg.arm_mode!r}")
+    self._use_knee_swing = cfg.arm_mode == "knee_swing"
+    if self._use_knee_swing:
+      knee_ids, _ = self._entity.find_joints(
+        (G1_LEFT_KNEE_NAME, G1_RIGHT_KNEE_NAME), preserve_order=True
+      )
+      self._knee_ids = torch.tensor(knee_ids, device=self.device, dtype=torch.long)
+      self._left_shoulder_col = arm_names.index(G1_LEFT_SHOULDER_PITCH_NAME)
+      self._right_shoulder_col = arm_names.index(G1_RIGHT_SHOULDER_PITCH_NAME)
+      self._motion_lib = None
+      self._motion_ids = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+      self._motion_times = torch.zeros(self.num_envs, device=self.device)
+    elif cfg.arms_from_motion_command:
       # Arms are read from the motion command each step — no need for an
       # independent motion library / random motion tracking per env.
       self._motion_lib = None
@@ -95,7 +131,8 @@ class G1LocoTeacherAction(ActionTerm):
       self._motion_ids = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
       self._motion_times = torch.zeros(self.num_envs, device=self.device)
       self._resample_motion(torch.arange(self.num_envs, device=self.device))
-    self._refresh_arm_targets(env_ids=slice(None))
+    if not self._use_knee_swing:
+      self._refresh_arm_targets(env_ids=slice(None))
 
   @property
   def action_dim(self) -> int:
@@ -121,12 +158,18 @@ class G1LocoTeacherAction(ActionTerm):
         min=self._clip[:, :, 0],
         max=self._clip[:, :, 1],
       )
-    self._refresh_arm_targets(env_ids=slice(None))
+    if not self._use_knee_swing:
+      self._refresh_arm_targets(env_ids=slice(None))
     self._joint_target_pos = torch.cat(
       (self._processed_body_targets, self._arm_target_pos), dim=-1
     )
 
   def apply_actions(self) -> None:
+    if self._use_knee_swing:
+      self._apply_knee_arm_swing()
+      self._joint_target_pos = torch.cat(
+        (self._processed_body_targets, self._arm_target_pos), dim=-1
+      )
     encoder_bias = self._entity.data.encoder_bias[:, self._joint_ids]
     target = self._joint_target_pos - encoder_bias
     self._entity.set_joint_position_target(target, joint_ids=self._joint_ids)
@@ -137,14 +180,27 @@ class G1LocoTeacherAction(ActionTerm):
 
     env_ids_tensor = self._slice_to_env_ids(env_ids)
     if env_ids_tensor.numel() > 0:
-      if not self.cfg.arms_from_motion_command:
+      if not self._use_knee_swing and not self.cfg.arms_from_motion_command:
         self._resample_motion(env_ids_tensor)
       self._raw_actions[env_ids] = 0.0
       self._processed_body_targets[env_ids] = self._body_default_pos[env_ids]
-      self._refresh_arm_targets(env_ids)
+      if self._use_knee_swing:
+        self._arm_target_pos[env_ids] = self._arm_default_pos[env_ids]
+      else:
+        self._refresh_arm_targets(env_ids)
       self._joint_target_pos[env_ids] = torch.cat(
         (self._processed_body_targets[env_ids], self._arm_target_pos[env_ids]), dim=-1
       )
+
+  def _apply_knee_arm_swing(self) -> None:
+    left_off, right_off = knee_diff_shoulder_offsets(
+      self._entity.data.joint_pos[:, self._knee_ids[0]],
+      self._entity.data.joint_pos[:, self._knee_ids[1]],
+    )
+    arm_target = self._arm_default_pos.clone()
+    arm_target[:, self._left_shoulder_col] += left_off
+    arm_target[:, self._right_shoulder_col] += right_off
+    self._arm_target_pos[:] = arm_target
 
   def _resolve_scale(
     self, scale: float | dict[str, float], joint_names: list[str]

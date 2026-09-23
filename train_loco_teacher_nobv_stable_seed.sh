@@ -10,6 +10,12 @@ set -euo pipefail
 # Set WBC_ATTACH_PAYLOADS=0 to disable for this run.
 export WBC_ATTACH_PAYLOADS="${WBC_ATTACH_PAYLOADS:-1}"
 
+# Run from repo root so the top-level ``deploy/`` namespace package is on
+# sys.path (g1_constants_custom.py imports it during wbc_mjlab init).
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "${SCRIPT_DIR}"
+export PYTHONPATH="${SCRIPT_DIR}${PYTHONPATH:+:${PYTHONPATH}}"
+
 GPU_ID="0"
 if [[ -n "${1:-}" && "${1:-}" != --* ]]; then
   GPU_ID="${1}"
@@ -19,7 +25,6 @@ fi
 CUDA_VISIBLE_DEVICES="${GPU_ID}" uv run train Loco-Teacher-Flat-Unitree-G1-NoBV-Stable \
   --agent.experiment-name g1_loco_teacher_nobv_stable_seed \
   --agent.run-name g1_loco_teacher_nobv_stable_seed \
-  --env.commands.motion.motion-file /home/yangl/handoff/seed_g1_cbf_standing_payload/seed_dataset_filtered.yaml \
   --env.scene.num-envs 4096 \
   --video True \
   --video-interval 48000 \

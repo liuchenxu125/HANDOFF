@@ -42,14 +42,12 @@ from wbc_mjlab.actions import (
   DEFAULT_G1_LOCO_TEACHER_ACTION_SCALE,
   G1LocoTeacherActionCfg,
 )
-from wbc_mjlab.commands import LocoArmMotionCommandCfg
 from wbc_mjlab.commands import PklMotionCommandCfg
-from wbc_mjlab import curriculums as wbc_curriculums
 from wbc_mjlab import events as wbc_events
 from wbc_mjlab import observations as wbc_obs
 from wbc_mjlab import rewards as wbc_rewards
 from wbc_mjlab import terminations as wbc_terms
-from wbc_mjlab.g1_constants_custom import _ANKLE_DOF_INDICES, _BASE_ANG_VEL_SCALE, _DUAL_BASELINE_ADDED_LOCO_REWARDS, _DUAL_BASELINE_MOTION_GATE_THRESHOLD, _JOINT_POS_SCALE, _JOINT_VEL_SCALE, _JOINT_VEL_SCALE_WITH_ANKLE_MASK, _LOCO_BODY_STD_RUNNING, _LOCO_BODY_STD_WALKING, _LOCO_FIXED_ANG_VEL_RANGE, _LOCO_FIXED_BASE_HEIGHT_RANGE, _LOCO_FIXED_LIN_VEL_RANGE, _LOCO_HEIGHT_CAP, _LOCO_WARMUP_SCALE, _HANDOFF_BASE_MASS_RANGE, _HANDOFF_LOCO_MOTION_FILE, _HANDOFF_MOTOR_STRENGTH_RANGE, _WBC_DEFAULT_NUM_ENVS
+from wbc_mjlab.g1_constants_custom import _ANKLE_DOF_INDICES, _BASE_ANG_VEL_SCALE, _DUAL_BASELINE_ADDED_LOCO_REWARDS, _DUAL_BASELINE_MOTION_GATE_THRESHOLD, _JOINT_POS_SCALE, _JOINT_VEL_SCALE, _JOINT_VEL_SCALE_WITH_ANKLE_MASK, _LOCO_BODY_STD_RUNNING, _LOCO_BODY_STD_WALKING, _LOCO_FIXED_ANG_VEL_RANGE, _LOCO_FIXED_BASE_HEIGHT_RANGE, _LOCO_FIXED_LIN_VEL_RANGE, _LOCO_HEIGHT_CAP, _LOCO_WARMUP_SCALE, _HANDOFF_BASE_MASS_RANGE, _HANDOFF_MOTOR_STRENGTH_RANGE, _WBC_DEFAULT_NUM_ENVS
 
 _DUAL_BASELINE_REWARD_FUNC_OVERRIDES = {
   "foot_clearance": wbc_rewards.motion_feet_clearance,
@@ -1351,7 +1349,7 @@ def _apply_loco_teacher_reward_shaping(cfg: ManagerBasedRlEnvCfg) -> None:
     weight=-5.0,
     params={
       "command_name": "twist",
-      "asset_cfg": SceneEntityCfg("robot", joint_names=(".*",)),
+      "asset_cfg": SceneEntityCfg("robot", joint_names=wbc_obs.BODY_JOINT_NAMES),
     },
   )
   cfg.rewards["flat_foot"] = RewardTermCfg(
@@ -1408,7 +1406,7 @@ def _configure_loco_teacher_15dof_arm(
   command_ranges: dict[str, tuple[float, float]] | None = None,
   include_height_scan: bool = False,
 ) -> ManagerBasedRlEnvCfg:
-  """Apply shared locomotion-teacher 15-DoF + motion-arm wiring to a velocity cfg."""
+  """Apply shared locomotion-teacher 15-DoF + knee-mapped arm swing wiring."""
   if command_ranges is None:
     command_ranges = {
       "lin_vel_x": (-1.0, 1.0),
@@ -1452,42 +1450,15 @@ def _configure_loco_teacher_15dof_arm(
     },
   )
 
-  cfg.commands["motion"] = LocoArmMotionCommandCfg(
-    motion_file=_HANDOFF_LOCO_MOTION_FILE,
-    body_names=("torso_link",),
-  )
-
-  import os
-  try:
-    arm_blend = float(os.environ.get("ARM_BLEND", "0.0"))
-  except ValueError:
-    print(f"[WARN] Invalid ARM_BLEND value: {os.environ.get('ARM_BLEND')}. Defaulting to 0.0")
-    arm_blend = 0.0
-
-
   joint_pos_action = G1LocoTeacherActionCfg(
     entity_name="robot",
     body_joint_names=wbc_obs.BODY_JOINT_NAMES,
     arm_joint_names=wbc_obs.ARM_JOINT_NAMES,
-    motion_command_name="motion",
     scale=DEFAULT_G1_LOCO_TEACHER_ACTION_SCALE,
     use_default_offset=True,
-    init_blend=arm_blend,
-    curriculum_start_step=12500 * 24,
-    curriculum_step=0.002,
-    curriculum_threshold_lin=0.7,
-    curriculum_threshold_ang=0.45,
+    arm_mode="knee_swing",
   )
   cfg.actions["joint_pos"] = joint_pos_action
-  cfg.curriculum["loco_arm_blend"] = CurriculumTermCfg(
-    func=wbc_curriculums.loco_arm_blend,
-    params={
-      "action_term_name": "joint_pos",
-      "command_name": joint_pos_action.standing_command_name,
-      "tracking_lin_reward_name": joint_pos_action.tracking_lin_reward_name,
-      "tracking_ang_reward_name": joint_pos_action.tracking_ang_reward_name,
-    },
-  )
 
   cfg.observations = {
     "actor": ObservationGroupCfg(
