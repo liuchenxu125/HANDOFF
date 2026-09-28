@@ -1040,7 +1040,7 @@ class command_conditioned_swing_height_curve:
 
 
 class command_conditioned_feet_swing_height:
-  """Penalize landing peak-height error with a lower pure-turn target."""
+  """Penalize landing peak-height error with blended targets and weights."""
 
   def __init__(self, cfg: RewardTermCfg, env: ManagerBasedRlEnv):
     height_sensor = env.scene[cfg.params["height_sensor_name"]]
@@ -1065,6 +1065,7 @@ class command_conditioned_feet_swing_height:
     command_threshold: float = 0.05,
     turning_linear_threshold: float = 0.2,
     turning_angular_threshold: float = 0.2,
+    turning_weight_scale: float = 1.0,
   ) -> torch.Tensor:
     contact_sensor: ContactSensor = env.scene[sensor_name]
     assert contact_sensor.data.found is not None
@@ -1093,7 +1094,11 @@ class command_conditioned_feet_swing_height:
     angular_norm = torch.abs(command[:, 2])
     active = (linear_norm + angular_norm > command_threshold).float()
     error = self.peak_heights / target_height - 1.0
-    cost = torch.sum(torch.square(error) * first_contact.float(), dim=1) * active
+    weight_scale = 1.0 + turn_blend * (turning_weight_scale - 1.0)
+    cost = (
+      torch.sum(torch.square(error) * first_contact.float(), dim=1)
+      * active * weight_scale
+    )
 
     landing_mask = first_contact.float() * active.unsqueeze(1)
     num_landings = torch.clamp(torch.sum(landing_mask), min=1.0)
@@ -1163,6 +1168,119 @@ def command_conditioned_feet_clearance(
   return cost * active
 
 
+class command_conditioned_feet_clearance_with_turn_curve:
+  """Hybrid foot-lift reward: free clearance for translation, time-curve for turning.
+
+  Translation (turn_blend ~ 0) uses the G1-style velocity-weighted clearance
+  ``|foot_height - target| * foot_vel`` with NO time template, so swing
+  duration and horizontal reach stay free to scale with command speed.
+
+  Turning (turn_blend ~ 1) switches to the half-sine time-curve template
+  ``peak * sin(pi * air_time / swing_time)`` — a fixed swing time and height
+  profile, which is the rigid gait template in-place turns need (short,
+  quick, well-timed steps). The time template only kicks in while turning,
+  so straight-walk step length is never locked by it.
+
+  The two costs are blended by ``command_turning_blend``; both are gated by
+  the command being active.
+  """
+
+  def __init__(self, cfg: RewardTermCfg, env: ManagerBasedRlEnv):
+    height_sensor = env.scene[cfg.params["height_sensor_name"]]
+    assert isinstance(height_sensor, TerrainHeightSensor), (
+      "command_conditioned_feet_clearance_with_turn_curve requires a "
+      f"TerrainHeightSensor, got {type(height_sensor).__name__}"
+    )
+    num_feet = height_sensor.num_frames
+    self.turning_peak_height = _positive_per_foot_target(
+      cfg.params["turning_peak_height"],
+      num_feet=num_feet,
+      device=env.device,
+      name="turning_peak_height",
+    )
+    self.turning_swing_time = _positive_per_foot_target(
+      cfg.params["turning_swing_time"],
+      num_feet=num_feet,
+      device=env.device,
+      name="turning_swing_time",
+    )
+
+  def __call__(
+    self,
+    env: ManagerBasedRlEnv,
+    height_sensor_name: str,
+    sensor_name: str,
+    translation_target_height: float,
+    turning_peak_height: float | tuple[float, ...],
+    turning_swing_time: float | tuple[float, ...],
+    command_name: str = "twist",
+    command_threshold: float = 0.05,
+    turning_linear_threshold: float = 0.2,
+    turning_angular_threshold: float = 0.2,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+    turning_weight_scale: float = 1.0,
+    turning_command_threshold: float | None = None,
+  ) -> torch.Tensor:
+    del turning_peak_height, turning_swing_time  # Precomputed in __init__.
+    asset = _get_robot(env, asset_cfg)
+    height_sensor = env.scene[height_sensor_name]
+    assert isinstance(height_sensor, TerrainHeightSensor)
+    contact_sensor: ContactSensor = env.scene[sensor_name]
+    assert contact_sensor.data.found is not None
+    assert contact_sensor.data.current_air_time is not None
+
+    foot_height = height_sensor.data.heights  # [B, F]
+    foot_vel_xy = asset.data.site_lin_vel_w[:, asset_cfg.site_ids, :2]  # [B, F, 2]
+    vel_norm = torch.norm(foot_vel_xy, dim=-1)  # [B, F]
+    current_air_time = contact_sensor.data.current_air_time  # [B, F]
+    in_air = (contact_sensor.data.found == 0).float()  # [B, F]
+
+    command = env.command_manager.get_command(command_name)
+    assert command is not None
+    turn_blend = command_turning_blend(
+      command,
+      turning_linear_threshold=turning_linear_threshold,
+      turning_angular_threshold=turning_angular_threshold,
+    )  # [B]
+    tb = turn_blend.unsqueeze(1)  # [B, 1]
+
+    # Translation: velocity-weighted clearance (free step length).
+    trans_target = torch.full_like(tb, translation_target_height)
+    clearance_cost = torch.abs(foot_height - trans_target) * vel_norm  # [B, F]
+
+    # Turning: half-sine time-curve template (fixed swing time + peak).
+    swing_progress = torch.clamp(
+      current_air_time / self.turning_swing_time, min=0.0, max=1.0
+    )
+    desired_height = self.turning_peak_height * torch.sin(torch.pi * swing_progress)
+    curve_cost = (
+      torch.square((foot_height - desired_height) / self.turning_peak_height) * in_air
+    )  # [B, F]
+
+    linear_norm = torch.norm(command[:, :2], dim=1)
+    angular_norm = torch.abs(command[:, 2])
+    active = (linear_norm + angular_norm > command_threshold).float()
+
+    # Gate each branch separately so pure turns can retain their old threshold.
+    turn_threshold = (
+      command_threshold if turning_command_threshold is None
+      else turning_command_threshold
+    )
+    turning_active = (linear_norm + angular_norm > turn_threshold).float()
+    cost = torch.sum(
+      (1.0 - tb) * clearance_cost * active.unsqueeze(1)
+      + tb * curve_cost * turning_weight_scale * turning_active.unsqueeze(1),
+      dim=1,
+    )
+
+    num_swing = torch.clamp(torch.sum(in_air * active.unsqueeze(1)), min=1.0)
+    env.extras["log"]["Metrics/swing_height_turn_blend_mean"] = turn_blend.mean()
+    env.extras["log"]["Metrics/swing_height_curve_rmse"] = torch.sqrt(
+      torch.sum(curve_cost * active.unsqueeze(1)) / num_swing
+    )
+    return cost
+
+
 def command_conditioned_feet_air_time(
   env: ManagerBasedRlEnv,
   sensor_name: str,
@@ -1173,8 +1291,13 @@ def command_conditioned_feet_air_time(
   command_threshold: float = 0.2,
   turning_linear_threshold: float = 0.2,
   turning_angular_threshold: float = 0.2,
+  turning_only: bool = False,
 ) -> torch.Tensor:
-  """Dense air-time reward with a shorter window for in-place turns."""
+  """Dense air-time reward with a shorter window for in-place turns.
+
+  With ``turning_only=True``, scale the reward by the command's turn blend so
+  straight translation receives no contribution.
+  """
   sensor: ContactSensor = env.scene[sensor_name]
   current_air_time = sensor.data.current_air_time
   assert current_air_time is not None
@@ -1204,6 +1327,8 @@ def command_conditioned_feet_air_time(
     torch.sum(current_air_time * in_air.float()) / num_in_air
   )
   env.extras["log"]["Metrics/air_time_max_target_mean"] = threshold_max.mean()
+  if turning_only:
+    reward = reward * turn_blend
   return reward * active
 
 
@@ -1259,6 +1384,33 @@ def stand_pose(
   )
   twist_cmd = env.command_manager.get_term(command_name)
   return error * twist_cmd.is_standing_env.float()
+
+
+def standing_feet_slip(
+  env: ManagerBasedRlEnv,
+  sensor_name: str,
+  command_name: str,
+  command_threshold: float = 0.2,
+  asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+  """Penalize contacting-foot slip for standing or near-standing commands."""
+  asset = _get_robot(env, asset_cfg)
+  contact_sensor: ContactSensor = env.scene[sensor_name]
+  command = env.command_manager.get_command(command_name)
+  assert command is not None
+  linear_norm = torch.norm(command[:, :2], dim=1)
+  angular_norm = torch.abs(command[:, 2])
+  standing = (linear_norm + angular_norm < command_threshold).float()
+  assert contact_sensor.data.found is not None
+  in_contact = (contact_sensor.data.found > 0).float()
+  foot_vel_xy = asset.data.site_lin_vel_w[:, asset_cfg.site_ids, :2]
+  slip_speed = torch.norm(foot_vel_xy, dim=-1)
+  cost = torch.sum(torch.square(slip_speed) * in_contact, dim=1) * standing
+  standing_contact = in_contact * standing.unsqueeze(1)
+  env.extras["log"]["Metrics/standing_slip_velocity_mean"] = torch.sum(
+    slip_speed * standing_contact
+  ) / torch.clamp(torch.sum(standing_contact), min=1)
+  return cost
 
 
 def flat_foot(
@@ -1720,6 +1872,50 @@ class ankle_dof_acc:
     return torch.sum(torch.square(asset.data.joint_acc[:, self._joint_ids]), dim=1)
 
 
+class ankle_action_acc_l2:
+  """Second-order action smoothness (jerk) restricted to ankle pitch.
+
+  ``mjlab.envs.mdp.rewards.action_acc_l2`` penalizes the second difference of
+  the *entire* action vector with equal weight across all dims. The ankle
+  pitch joints (leg_[lr]5) are the ones that chatter — ``swing_foot_orientation``
+  forces continuous ankle adjustment to hold the foot flat during swing — while
+  the knees stay smooth. A global action_acc_l2 therefore dilutes its effort
+  across joints that don't need it and under-delivers to the ankle. This term
+  applies the jerk penalty only to the ankle pitch action dims, giving the
+  ankle a stronger, targeted smoothness push without over-constraining the
+  rest. Operates on raw policy output (before per-term scale/offset).
+  """
+
+  def __init__(self, cfg: RewardTermCfg, env: ManagerBasedRlEnv):
+    joint_names = cfg.params.get(
+      "joint_names", ("leg_l5_joint", "leg_r5_joint")
+    )
+    action_term_name = cfg.params.get("action_term_name", "joint_pos")
+    term = env.action_manager.get_term(action_term_name)
+    target_names = list(term._target_names)
+    missing = [n for n in joint_names if n not in target_names]
+    if missing:
+      raise ValueError(
+        f"ankle_action_acc_l2: joints {missing} not in action term "
+        f"{action_term_name!r} (targets: {target_names})"
+      )
+    indices = [target_names.index(n) for n in joint_names]
+    self._action_indices = torch.tensor(
+      indices, device=env.device, dtype=torch.long
+    )
+
+  def __call__(
+    self,
+    env: ManagerBasedRlEnv,
+    joint_names: tuple[str, ...] = ("leg_l5_joint", "leg_r5_joint"),
+    action_term_name: str = "joint_pos",
+  ) -> torch.Tensor:
+    del joint_names, action_term_name  # Precomputed in __init__.
+    am = env.action_manager
+    action_acc = am.action - 2.0 * am.prev_action + am.prev_prev_action
+    return torch.sum(torch.square(action_acc[:, self._action_indices]), dim=1)
+
+
 class ankle_dof_vel:
   """HANDOFF ankle-only velocity penalty."""
 
@@ -1943,8 +2139,6 @@ def motion_soft_landing(
 # ---------------------------------------------------------------------------
 # CBF reward (additive — attached only in the CBF task variant)
 # ---------------------------------------------------------------------------
-
-
 
 
 
