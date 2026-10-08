@@ -242,7 +242,7 @@ def _apply_flat_terrain(cfg: ManagerBasedRlEnvCfg) -> None:
 def _apply_loco_rewards(cfg: ManagerBasedRlEnvCfg) -> None:
   """Casbot02 velocity-tracking reward stack with G1 foot shaping."""
 
-  cfg.rewards["action_rate_l2"].weight = -0.2
+  cfg.rewards["action_rate_l2"].weight = -0.1
 
   # Straight translation uses velocity-weighted clearance with no time curve.
   # In-place turning follows the 2026-09-22 half-sine height/time curve.
@@ -258,7 +258,7 @@ def _apply_loco_rewards(cfg: ManagerBasedRlEnvCfg) -> None:
     params={
       "height_sensor_name": "foot_height_scan",
       "sensor_name": "feet_ground_contact",
-      "translation_target_height": 0.08,
+      "translation_target_height": 0.12,
       "turning_peak_height": 0.065,
       "turning_swing_time": 0.40,
       "turning_weight_scale": 0.5,  # -6 * 0.5 = old turning weight -3.
@@ -280,7 +280,7 @@ def _apply_loco_rewards(cfg: ManagerBasedRlEnvCfg) -> None:
     params={
       "sensor_name": "feet_ground_contact",
       "height_sensor_name": "foot_height_scan",
-      "translation_target_height": 0.12,
+      "translation_target_height": 0.15,
       "turning_target_height": 0.07,
       "turning_weight_scale": 1.0 / 3.0,  # -0.75 / 3 = -0.25.
       "command_name": "twist",
@@ -290,26 +290,26 @@ def _apply_loco_rewards(cfg: ManagerBasedRlEnvCfg) -> None:
     },
   )
   cfg.rewards["foot_slip"].weight = -1.0
-  cfg.rewards["foot_slip"].params["command_threshold"] = 0.2
-  cfg.rewards["foot_slip"].params["asset_cfg"] = _force_site_asset()
+  cfg.rewards["foot_slip"].params["command_threshold"] = 0.05
+  cfg.rewards["foot_slip"].params["asset_cfg"] = _feet_site_asset()
   cfg.rewards["standing_feet_slip"] = RewardTermCfg(
     func=wbc_rewards.standing_feet_slip,
     weight=-2.0,
     params={
       "sensor_name": "feet_ground_contact",
       "command_name": "twist",
-      "command_threshold": 0.2,
+      "command_threshold": 0.05,
       "asset_cfg": _force_site_asset(),
     },
   )
-  cfg.rewards["soft_landing"].weight = -3e-3
+  cfg.rewards["soft_landing"].weight = 4e-3
 
   # Keep the current translation gait, but restore the 2026-09-22 dense
   # air-time reward for the turning branch only.
   cfg.rewards.pop("air_time", None)
   cfg.rewards["turning_air_time"] = RewardTermCfg(
     func=wbc_rewards.command_conditioned_feet_air_time,
-    weight=1.0,
+    weight=1.5,
     params={
       "sensor_name": "feet_ground_contact",
       "command_name": "twist",
@@ -322,15 +322,18 @@ def _apply_loco_rewards(cfg: ManagerBasedRlEnvCfg) -> None:
       "turning_only": True,
     },
   )
-  # cfg.rewards["feet_air_time"] = RewardTermCfg(
-  #   func=wbc_rewards.feet_air_time,
-  #   weight=1.5,
-  #   params={
-  #     "sensor_name": "feet_ground_contact",
-  #     "uniform_cmd_name": "twist",
-  #     "feet_air_time_target": None,
-  #   },
-  # )
+  # Forward/backward translation: reward every completed airborne interval in
+  # direct proportion to its duration.  ``None`` deliberately leaves the air
+  # time uncapped; the zero-command startup hold is excluded by the command gate.
+  cfg.rewards["feet_air_time"] = RewardTermCfg(
+    func=wbc_rewards.feet_air_time,
+    weight=1.5,
+    params={
+      "sensor_name": "feet_ground_contact",
+      "uniform_cmd_name": "twist",
+      "feet_air_time_target": None,
+    },
+  )
 
   # Per-robot wiring: root/torso bodies + leg joints.
   cfg.rewards["track_linear_velocity"].params["asset_cfg"] = _torso_asset()
@@ -422,22 +425,22 @@ def _apply_loco_rewards(cfg: ManagerBasedRlEnvCfg) -> None:
   #     "asset_cfg": _feet_body_asset(),
   #   },
   # )
-  cfg.rewards["body_ang_vel"].weight = -0.05
-  cfg.rewards["body_ang_vel"].params["asset_cfg"] = _torso_asset()
-  cfg.rewards["angular_momentum"].weight = -0.02
+  # cfg.rewards["body_ang_vel"].weight = -0.05
+  # cfg.rewards["body_ang_vel"].params["asset_cfg"] = _torso_asset()
+  # cfg.rewards["angular_momentum"].weight = -0.02
   # G1 loco teacher whole-body momentum-change penalties (jerk, not magnitude).
   # Penalize the rate of change of linear/angular momentum so turning is not
   # over-penalized (only sudden changes are). Aligned with G1's stable variant.
-  # cfg.rewards["linear_momentum_change"] = RewardTermCfg(
-  #   func=wbc_rewards.LinearMomentumChangePenalty,
-  #   weight=1e-6,
-  #   params={},
-  # )
-  # cfg.rewards["angular_momentum_change"] = RewardTermCfg(
-  #   func=wbc_rewards.AngularMomentumChangePenalty,
-  #   weight=1e-5,
-  #   params={},
-  # )
+  cfg.rewards["linear_momentum_change"] = RewardTermCfg(
+    func=wbc_rewards.LinearMomentumChangePenalty,
+    weight=1e-6,
+    params={},
+  )
+  cfg.rewards["angular_momentum_change"] = RewardTermCfg(
+    func=wbc_rewards.AngularMomentumChangePenalty,
+    weight=1e-5,
+    params={},
+  )
   # Added after the 2026-09-02 reference run; keep disabled while reproducing
   # that policy's reward configuration.
   # cfg.rewards["straight_hip_yaw_pos_l2"] = RewardTermCfg(
