@@ -243,6 +243,16 @@ def _apply_loco_rewards(cfg: ManagerBasedRlEnvCfg) -> None:
   """Casbot02 velocity-tracking reward stack with G1 foot shaping."""
 
   cfg.rewards["action_rate_l2"].weight = -0.1
+  # Extra first-order smoothing on ankle pitch; all other action dims retain
+  # only the global action-rate cost above.
+  cfg.rewards["ankle_action_rate_l2"] = RewardTermCfg(
+    func=wbc_rewards.ankle_action_rate_l2,
+    weight=-0.1,
+    params={
+      "joint_names": ("leg_l5_joint", "leg_r5_joint"),
+      "action_term_name": "joint_pos",
+    },
+  )
 
   # Straight translation uses velocity-weighted clearance with no time curve.
   # In-place turning follows the 2026-09-22 half-sine height/time curve.
@@ -302,36 +312,25 @@ def _apply_loco_rewards(cfg: ManagerBasedRlEnvCfg) -> None:
       "asset_cfg": _force_site_asset(),
     },
   )
-  cfg.rewards["soft_landing"].weight = 4e-3
+  cfg.rewards["soft_landing"].weight = -4e-3
 
-  # Keep the current translation gait, but restore the 2026-09-22 dense
-  # air-time reward for the turning branch only.
+  # One term, preserving the sum of the previous two rewards: uncapped
+  # landing-time reward for translation + dense turn-blended air-time reward.
   cfg.rewards.pop("air_time", None)
-  cfg.rewards["turning_air_time"] = RewardTermCfg(
-    func=wbc_rewards.command_conditioned_feet_air_time,
+  cfg.rewards.pop("turning_air_time", None)
+  cfg.rewards["feet_air_time"] = RewardTermCfg(
+    func=wbc_rewards.locomotion_feet_air_time,
     weight=1.5,
     params={
       "sensor_name": "feet_ground_contact",
       "command_name": "twist",
+      "feet_air_time_target": None,
       "threshold_min": 0.05,
       "translation_threshold_max": 0.60,
       "turning_threshold_max": 0.42,
       "command_threshold": 0.2,
       "turning_linear_threshold": 0.2,
       "turning_angular_threshold": 0.2,
-      "turning_only": True,
-    },
-  )
-  # Forward/backward translation: reward every completed airborne interval in
-  # direct proportion to its duration.  ``None`` deliberately leaves the air
-  # time uncapped; the zero-command startup hold is excluded by the command gate.
-  cfg.rewards["feet_air_time"] = RewardTermCfg(
-    func=wbc_rewards.feet_air_time,
-    weight=1.5,
-    params={
-      "sensor_name": "feet_ground_contact",
-      "uniform_cmd_name": "twist",
-      "feet_air_time_target": None,
     },
   )
 
@@ -433,12 +432,12 @@ def _apply_loco_rewards(cfg: ManagerBasedRlEnvCfg) -> None:
   # over-penalized (only sudden changes are). Aligned with G1's stable variant.
   cfg.rewards["linear_momentum_change"] = RewardTermCfg(
     func=wbc_rewards.LinearMomentumChangePenalty,
-    weight=1e-6,
+    weight=3e-6,
     params={},
   )
   cfg.rewards["angular_momentum_change"] = RewardTermCfg(
     func=wbc_rewards.AngularMomentumChangePenalty,
-    weight=1e-5,
+    weight=2e-5,
     params={},
   )
   # Added after the 2026-09-02 reference run; keep disabled while reproducing

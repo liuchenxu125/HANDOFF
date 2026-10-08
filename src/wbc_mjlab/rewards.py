@@ -1872,6 +1872,44 @@ class ankle_dof_acc:
     return torch.sum(torch.square(asset.data.joint_acc[:, self._joint_ids]), dim=1)
 
 
+class ankle_action_rate_l2:
+  """First-order raw-action difference restricted to ankle pitch.
+
+  Matches ``env_mdp.action_rate_l2`` (no scale or dt normalization), but
+  selects only the requested joints. Added to the global action-rate cost.
+  """
+
+  def __init__(self, cfg: RewardTermCfg, env: ManagerBasedRlEnv):
+    joint_names = cfg.params.get("joint_names", ("leg_l5_joint", "leg_r5_joint"))
+    action_term_name = cfg.params.get("action_term_name", "joint_pos")
+    am = env.action_manager
+    target_names = list(am.get_term(action_term_name).target_names)
+    missing = [name for name in joint_names if name not in target_names]
+    if missing:
+      raise ValueError(
+        f"ankle_action_rate_l2: joints {missing} not in action term "
+        f"{action_term_name!r} (targets: {target_names})"
+      )
+    term_index = am.active_terms.index(action_term_name)
+    offset = sum(am.action_term_dim[:term_index])
+    self._action_indices = torch.tensor(
+      [offset + target_names.index(name) for name in joint_names],
+      device=env.device,
+      dtype=torch.long,
+    )
+
+  def __call__(
+    self,
+    env: ManagerBasedRlEnv,
+    joint_names: tuple[str, ...] = ("leg_l5_joint", "leg_r5_joint"),
+    action_term_name: str = "joint_pos",
+  ) -> torch.Tensor:
+    del joint_names, action_term_name  # Precomputed in __init__.
+    am = env.action_manager
+    action_diff = am.action[:, self._action_indices] - am.prev_action[:, self._action_indices]
+    return torch.sum(torch.square(action_diff), dim=1)
+
+
 class ankle_action_acc_l2:
   """Second-order action smoothness (jerk) restricted to ankle pitch.
 
@@ -1972,6 +2010,54 @@ class feet_air_time:
 
   def reset(self, env_ids: torch.Tensor | slice | None) -> None:
     del env_ids
+
+
+class locomotion_feet_air_time:
+  """Sum landing-time translation and dense turning rewards in one term.
+
+  Reuses the original formulas and command gates, including their overlap for
+  mixed commands. With the original common weight, only the reward/log name
+  changes; the total contribution stays the same.
+  """
+
+  def __init__(self, cfg: RewardTermCfg, env: ManagerBasedRlEnv):
+    self._translation_reward = feet_air_time(cfg, env)
+
+  def __call__(
+    self,
+    env: ManagerBasedRlEnv,
+    sensor_name: str,
+    command_name: str = "twist",
+    feet_air_time_target: float | None = None,
+    threshold_min: float = 0.05,
+    translation_threshold_max: float = 0.60,
+    turning_threshold_max: float = 0.42,
+    command_threshold: float = 0.2,
+    turning_linear_threshold: float = 0.2,
+    turning_angular_threshold: float = 0.2,
+  ) -> torch.Tensor:
+    translation_reward = self._translation_reward(
+      env,
+      sensor_name=sensor_name,
+      uniform_cmd_name=command_name,
+      feet_air_time_target=feet_air_time_target,
+    )
+    turning_reward = command_conditioned_feet_air_time(
+      env,
+      sensor_name=sensor_name,
+      command_name=command_name,
+      threshold_min=threshold_min,
+      translation_threshold_max=translation_threshold_max,
+      turning_threshold_max=turning_threshold_max,
+      command_threshold=command_threshold,
+      turning_linear_threshold=turning_linear_threshold,
+      turning_angular_threshold=turning_angular_threshold,
+      turning_only=True,
+    )
+    return translation_reward + turning_reward
+
+  def reset(self, env_ids: torch.Tensor | slice | None) -> None:
+    self._translation_reward.reset(env_ids)
 
 
 def motion_air_time(
@@ -2139,8 +2225,6 @@ def motion_soft_landing(
 # ---------------------------------------------------------------------------
 # CBF reward (additive — attached only in the CBF task variant)
 # ---------------------------------------------------------------------------
-
-
 
 
 

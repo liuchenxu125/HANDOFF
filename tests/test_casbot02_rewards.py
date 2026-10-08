@@ -10,10 +10,61 @@ from wbc_mjlab.casbot02_config import (
 )
 from wbc_mjlab.casbot02_constants import CASBOT02_LEG_ONLY_JOINT_NAMES
 from wbc_mjlab.rewards import (
+  ankle_action_rate_l2,
   applied_torque_limits_by_ratio,
   joint_energy,
   joint_torques_l2,
 )
+
+
+class Casbot02AnkleActionRateRewardTest(unittest.TestCase):
+  def _make_env(self, target_names, leading_dims=0):
+    term = SimpleNamespace(target_names=target_names)
+    manager = SimpleNamespace(
+      get_term=lambda name: term,
+      active_terms=(["other"] if leading_dims else []) + ["joint_pos"],
+      action_term_dim=([leading_dims] if leading_dims else []) + [len(target_names)],
+      action=torch.zeros(2, leading_dims + len(target_names)),
+      prev_action=torch.zeros(2, leading_dims + len(target_names)),
+    )
+    return SimpleNamespace(action_manager=manager, device="cpu")
+
+  def test_loco_cfg_adds_ankle_term_without_changing_global_weight(self):
+    cfg = casbot02_loco_teacher_env_cfg()
+    self.assertEqual(cfg.rewards["action_rate_l2"].weight, -0.1)
+    term = cfg.rewards["ankle_action_rate_l2"]
+    self.assertIs(term.func, ankle_action_rate_l2)
+    self.assertEqual(term.weight, -0.01)
+    self.assertEqual(term.params["joint_names"], ("leg_l5_joint", "leg_r5_joint"))
+    self.assertEqual(term.params["action_term_name"], "joint_pos")
+
+  def test_only_pitch_action_differences_are_penalized(self):
+    names = list(CASBOT02_LEG_ONLY_JOINT_NAMES)
+    env = self._make_env(names)
+    reward = ankle_action_rate_l2(SimpleNamespace(params={}), env)
+    env.action_manager.action.fill_(100.0)
+    env.action_manager.prev_action[:, names.index("leg_l5_joint")] = 99.0
+    env.action_manager.prev_action[:, names.index("leg_r5_joint")] = 98.0
+    self.assertTrue(torch.equal(reward(env), torch.tensor([5.0, 5.0])))
+    # Constant, even large ankle targets have no first-order action-rate cost.
+    env.action_manager.prev_action.copy_(env.action_manager.action)
+    self.assertTrue(torch.equal(reward(env), torch.zeros(2)))
+
+  def test_joint_mapping_handles_reordering_and_action_term_offset(self):
+    env = self._make_env(["leg_r5_joint", "leg_l1_joint", "leg_l5_joint"], leading_dims=2)
+    reward = ankle_action_rate_l2(SimpleNamespace(params={}), env)
+    env.action_manager.action[:] = torch.tensor(
+      [[100.0, 200.0, 2.0, 300.0, -3.0], [10.0, 20.0, 1.0, 30.0, 4.0]]
+    )
+    env.action_manager.prev_action[:] = torch.tensor(
+      [[0.0, 0.0, 1.0, 0.0, -1.0], [0.0, 0.0, 2.0, 0.0, 2.0]]
+    )
+    self.assertTrue(torch.equal(reward(env), torch.tensor([5.0, 5.0])))
+
+  def test_missing_joint_reports_configuration_error(self):
+    env = self._make_env(["leg_l5_joint"])
+    with self.assertRaisesRegex(ValueError, "leg_r5_joint"):
+      ankle_action_rate_l2(SimpleNamespace(params={}), env)
 
 
 class Casbot02TorqueEnergyRewardTest(unittest.TestCase):
