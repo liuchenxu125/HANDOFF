@@ -1,4 +1,4 @@
-"""CPU regression checks for merged translation/turning air-time rewards."""
+"""CPU checks for baseline air-time config and the retained merged helper."""
 
 import unittest
 from types import SimpleNamespace
@@ -30,23 +30,30 @@ class Casbot02AirTimeRewardTest(unittest.TestCase):
       extras={"log": {}},
     )
 
-  def test_config_preserves_weight_and_thresholds_in_one_term(self):
+  def test_config_restores_separate_baseline_terms(self):
     cfg = casbot02_loco_teacher_env_cfg()
     self.assertNotIn("air_time", cfg.rewards)
-    self.assertNotIn("turning_air_time", cfg.rewards)
     term = cfg.rewards["feet_air_time"]
-    self.assertIs(term.func, locomotion_feet_air_time)
-    self.assertEqual(term.weight, 1.5)
+    self.assertIs(term.func, feet_air_time)
+    self.assertEqual(term.weight, 1.0)
+    self.assertEqual(term.params, {
+      "sensor_name": "feet_ground_contact",
+      "uniform_cmd_name": "twist",
+      "feet_air_time_target": None,
+    })
+    term = cfg.rewards["turning_air_time"]
+    self.assertIs(term.func, command_conditioned_feet_air_time)
+    self.assertEqual(term.weight, 1.0)
     self.assertEqual(term.params, {
       "sensor_name": "feet_ground_contact",
       "command_name": "twist",
-      "feet_air_time_target": None,
       "threshold_min": 0.05,
       "translation_threshold_max": 0.60,
       "turning_threshold_max": 0.42,
       "command_threshold": 0.2,
       "turning_linear_threshold": 0.2,
       "turning_angular_threshold": 0.2,
+      "turning_only": True,
     })
 
   def test_matches_sum_of_old_terms_for_all_command_types(self):

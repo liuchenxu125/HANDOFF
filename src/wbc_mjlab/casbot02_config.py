@@ -195,6 +195,8 @@ def _self_collision_sensor() -> ContactSensorCfg:
 
 def _apply_casbot02_robot(cfg: ManagerBasedRlEnvCfg) -> None:
   """Swap in the Casbot02 robot, add its sensors, wire action + viewer."""
+  # Motor parameters and action scale follow the user's current shared constants,
+  # rather than the historical 2026-09-29 motor setup.
   cfg.scene.entities = {"robot": C.get_casbot02_23dof_robot_cfg()}
 
   cfg.scene.sensors = (cfg.scene.sensors or ()) + (
@@ -242,17 +244,9 @@ def _apply_flat_terrain(cfg: ManagerBasedRlEnvCfg) -> None:
 def _apply_loco_rewards(cfg: ManagerBasedRlEnvCfg) -> None:
   """Casbot02 velocity-tracking reward stack with G1 foot shaping."""
 
+  # Restore the exact reward set from 2026-09-29_10-44-27.
   cfg.rewards["action_rate_l2"].weight = -0.1
-  # Extra first-order smoothing on ankle pitch; all other action dims retain
-  # only the global action-rate cost above.
-  cfg.rewards["ankle_action_rate_l2"] = RewardTermCfg(
-    func=wbc_rewards.ankle_action_rate_l2,
-    weight=-0.1,
-    params={
-      "joint_names": ("leg_l5_joint", "leg_r5_joint"),
-      "action_term_name": "joint_pos",
-    },
-  )
+  cfg.rewards.pop("ankle_action_rate_l2", None)
 
   # Straight translation uses velocity-weighted clearance with no time curve.
   # In-place turning follows the 2026-09-22 half-sine height/time curve.
@@ -312,25 +306,32 @@ def _apply_loco_rewards(cfg: ManagerBasedRlEnvCfg) -> None:
       "asset_cfg": _force_site_asset(),
     },
   )
-  cfg.rewards["soft_landing"].weight = -4e-3
+  cfg.rewards["soft_landing"].weight = -3e-3
 
-  # One term, preserving the sum of the previous two rewards: uncapped
-  # landing-time reward for translation + dense turn-blended air-time reward.
+  # Restore the two separately logged baseline air-time rewards.
   cfg.rewards.pop("air_time", None)
-  cfg.rewards.pop("turning_air_time", None)
-  cfg.rewards["feet_air_time"] = RewardTermCfg(
-    func=wbc_rewards.locomotion_feet_air_time,
-    weight=1.5,
+  cfg.rewards["turning_air_time"] = RewardTermCfg(
+    func=wbc_rewards.command_conditioned_feet_air_time,
+    weight=1.0,
     params={
       "sensor_name": "feet_ground_contact",
       "command_name": "twist",
-      "feet_air_time_target": None,
       "threshold_min": 0.05,
       "translation_threshold_max": 0.60,
       "turning_threshold_max": 0.42,
       "command_threshold": 0.2,
       "turning_linear_threshold": 0.2,
       "turning_angular_threshold": 0.2,
+      "turning_only": True,
+    },
+  )
+  cfg.rewards["feet_air_time"] = RewardTermCfg(
+    func=wbc_rewards.feet_air_time,
+    weight=1.0,
+    params={
+      "sensor_name": "feet_ground_contact",
+      "uniform_cmd_name": "twist",
+      "feet_air_time_target": None,
     },
   )
 
@@ -427,17 +428,15 @@ def _apply_loco_rewards(cfg: ManagerBasedRlEnvCfg) -> None:
   # cfg.rewards["body_ang_vel"].weight = -0.05
   # cfg.rewards["body_ang_vel"].params["asset_cfg"] = _torso_asset()
   # cfg.rewards["angular_momentum"].weight = -0.02
-  # G1 loco teacher whole-body momentum-change penalties (jerk, not magnitude).
-  # Penalize the rate of change of linear/angular momentum so turning is not
-  # over-penalized (only sudden changes are). Aligned with G1's stable variant.
+  # Baseline whole-body momentum-rate penalties (not momentum magnitude).
   cfg.rewards["linear_momentum_change"] = RewardTermCfg(
     func=wbc_rewards.LinearMomentumChangePenalty,
-    weight=3e-6,
+    weight=1e-6,
     params={},
   )
   cfg.rewards["angular_momentum_change"] = RewardTermCfg(
     func=wbc_rewards.AngularMomentumChangePenalty,
-    weight=2e-5,
+    weight=1e-5,
     params={},
   )
   # Added after the 2026-09-02 reference run; keep disabled while reproducing
@@ -732,6 +731,12 @@ def casbot02_loco_teacher_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     cfg.observations["actor"].enable_corruption = False
     cfg.curriculum = {}
   else:
+    # Training launch values recorded in the 2026-09-29 reference snapshot.
+    # Play keeps its single-environment defaults; CLI can still override these.
+    cfg.seed = 42
+    cfg.scene.num_envs = 4096
+    assert cfg.scene.terrain is not None
+    cfg.scene.terrain.num_envs = 4096
     _apply_casbot02_dr(cfg)
 
   return cfg

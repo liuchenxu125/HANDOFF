@@ -29,14 +29,10 @@ class Casbot02AnkleActionRateRewardTest(unittest.TestCase):
     )
     return SimpleNamespace(action_manager=manager, device="cpu")
 
-  def test_loco_cfg_adds_ankle_term_without_changing_global_weight(self):
+  def test_loco_cfg_uses_baseline_global_action_rate_only(self):
     cfg = casbot02_loco_teacher_env_cfg()
-    self.assertEqual(cfg.rewards["action_rate_l2"].weight, -0.1)
-    term = cfg.rewards["ankle_action_rate_l2"]
-    self.assertIs(term.func, ankle_action_rate_l2)
-    self.assertEqual(term.weight, -0.01)
-    self.assertEqual(term.params["joint_names"], ("leg_l5_joint", "leg_r5_joint"))
-    self.assertEqual(term.params["action_term_name"], "joint_pos")
+    self.assertEqual(cfg.rewards["action_rate_l2"].weight, -0.2)
+    self.assertNotIn("ankle_action_rate_l2", cfg.rewards)
 
   def test_only_pitch_action_differences_are_penalized(self):
     names = list(CASBOT02_LEG_ONLY_JOINT_NAMES)
