@@ -39,7 +39,6 @@ from wbc_mjlab import casbot02_constants as C
 from wbc_mjlab import rewards as wbc_rewards
 from wbc_mjlab import observations as wbc_obs
 from wbc_mjlab.casbot02_actions import Casbot02LegWithArmSwingActionCfg
-from wbc_mjlab.casbot02_commands import Casbot02VelocityCommandCfg
 
 
 def _leg_asset() -> SceneEntityCfg:
@@ -619,28 +618,22 @@ def _apply_casbot02_dr(cfg: ManagerBasedRlEnvCfg) -> None:
 
 
 def _apply_twist_ranges(cfg: ManagerBasedRlEnvCfg) -> None:
-  """G1-aligned vx/wz curriculum plus a dedicated pure-turn cohort."""
+  """G1's independent command-mode sampling with Casbot02's speed curriculum."""
   base_twist_cmd = cfg.commands["twist"]
   assert isinstance(base_twist_cmd, UniformVelocityCommandCfg)
   vx, vy, wz = (-1.0, 1.0), (0.0, 0.0), (-1.0, 1.0)
-  twist_cmd = Casbot02VelocityCommandCfg(
+  twist_cmd = UniformVelocityCommandCfg(
     resampling_time_range=base_twist_cmd.resampling_time_range,
     debug_vis=base_twist_cmd.debug_vis,
     entity_name=base_twist_cmd.entity_name,
     heading_command=base_twist_cmd.heading_command,
     heading_control_stiffness=base_twist_cmd.heading_control_stiffness,
-    rel_standing_envs=base_twist_cmd.rel_standing_envs,
-    rel_turning_envs=0.2,
-    rel_startup_envs=0.1,
-    startup_standing_time_range=(2.0, 3.0),
-    startup_walking_time_range=(3.0, 4.0),
-    startup_speed_range=(0.3, 0.6),
-    rel_heading_envs=0.2,
-    rel_world_envs=base_twist_cmd.rel_world_envs,
+    rel_standing_envs=0.1,
+    rel_heading_envs=0.3,
+    rel_world_envs=0.0,
     rel_forward_envs=0.2,
-    init_velocity_prob=base_twist_cmd.init_velocity_prob,
-    min_turning_ang_vel=0.2,
-    ranges=Casbot02VelocityCommandCfg.Ranges(
+    init_velocity_prob=0.0,
+    ranges=UniformVelocityCommandCfg.Ranges(
       lin_vel_x=vx,
       lin_vel_y=vy,
       ang_vel_z=wz,

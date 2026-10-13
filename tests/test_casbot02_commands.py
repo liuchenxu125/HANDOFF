@@ -4,13 +4,23 @@ from types import SimpleNamespace
 
 import torch
 
-from wbc_mjlab.casbot02_commands import Casbot02VelocityCommand
+from mjlab.tasks.velocity.mdp.velocity_command import UniformVelocityCommandCfg
+from wbc_mjlab.casbot02_commands import Casbot02VelocityCommand, Casbot02VelocityCommandCfg
 from wbc_mjlab.casbot02_config import casbot02_loco_teacher_env_cfg
 
 
 class StartupCommandTest(unittest.TestCase):
   def make_command(self, count=10000, only_startup=True):
-    cfg = casbot02_loco_teacher_env_cfg().commands['twist']
+    # Test the retained startup helper independently of the active G1 sampler.
+    cfg = Casbot02VelocityCommandCfg(
+      entity_name='robot', resampling_time_range=(3., 8.),
+      heading_command=True, rel_standing_envs=.1, rel_heading_envs=.2,
+      rel_forward_envs=.2, rel_turning_envs=.2, rel_startup_envs=.1,
+      ranges=Casbot02VelocityCommandCfg.Ranges(
+        lin_vel_x=(-1., 1.), lin_vel_y=(0., 0.), ang_vel_z=(-1., 1.),
+        heading=(-torch.pi, torch.pi),
+      ),
+    )
     if only_startup:
       cfg.rel_standing_envs = cfg.rel_turning_envs = 0.0
       cfg.rel_forward_envs = cfg.rel_heading_envs = 0.0
@@ -127,6 +137,45 @@ class StartupCommandTest(unittest.TestCase):
     cmd.reset(torch.arange(cmd.num_envs))
     torch.testing.assert_close(cmd.startup_target_vx.abs(), torch.full((64,), .3))
     self.assertEqual(writes, [])
+
+
+class G1CommandAllocationTest(unittest.TestCase):
+  def test_active_sampler_matches_g1_and_preserves_speed_curriculum(self):
+    cfg = casbot02_loco_teacher_env_cfg()
+    command = cfg.commands['twist']
+    self.assertIs(type(command), UniformVelocityCommandCfg)
+    self.assertEqual(command.rel_standing_envs, .1)
+    self.assertEqual(command.rel_heading_envs, .3)
+    self.assertEqual(command.rel_forward_envs, .2)
+    self.assertEqual(command.rel_world_envs, 0.)
+    self.assertEqual(command.init_velocity_prob, 0.)
+    self.assertEqual(command.resampling_time_range, (3., 8.))
+    self.assertEqual(command.ranges.lin_vel_y, (0., 0.))
+    stages = cfg.curriculum['command_vel'].params['velocity_stages']
+    self.assertEqual([stage['step'] for stage in stages], [0, 60000, 120000, 192000])
+
+  def test_native_sampling_has_independent_overlapping_modes(self):
+    torch.manual_seed(42)
+    count = 30000
+    cfg = casbot02_loco_teacher_env_cfg().commands['twist']
+    env = SimpleNamespace(
+      num_envs=count, device='cpu', step_dt=.02,
+      scene={'robot': SimpleNamespace(data=SimpleNamespace(heading_w=torch.zeros(count)))},
+    )
+    cmd = cfg.build(env)
+    cmd.reset(torch.arange(count))
+    for mask, expected in ((cmd.is_standing_env, .1), (cmd.is_heading_env, .3),
+                           (cmd.is_forward_env, .2)):
+      self.assertLess(abs(mask.float().mean().item() - expected), .01)
+    overlap = cmd.is_forward_env & cmd.is_heading_env
+    self.assertLess(abs(overlap.float().mean().item() - .06), .01)
+    cmd._update_command()
+    self.assertTrue((cmd.command[cmd.is_standing_env] == 0).all())
+    forward_only = cmd.is_forward_env & ~cmd.is_heading_env & ~cmd.is_standing_env
+    self.assertTrue((cmd.command[forward_only, 0] >= .3).all())
+    self.assertTrue((cmd.command[forward_only, 1:] == 0).all())
+    heading_forward = overlap & ~cmd.is_standing_env
+    self.assertTrue((cmd.command[heading_forward, 2].abs() > 0).all())
 
 
 if __name__ == '__main__':
