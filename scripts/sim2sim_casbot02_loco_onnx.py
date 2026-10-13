@@ -1,7 +1,7 @@
 """Casbot02 12-leg loco teacher sim2sim (ONNX policy, keyboard command).
 
 Same structure as amp_mjlab's ``sim2sim_casbot02_leg_amp_onnx.py``, but:
-  * loads the loco teacher ONNX (12 action, 180 obs);
+  * loads the loco teacher ONNX (12 action, 180 legacy / 184 phase-aware obs);
   * builds the observation TERM-major (mjlab 1.4.0 layout: each term's 4-frame
     history contiguous), NOT time-major like the amp (mjlab 1.2.0) script.
 
@@ -305,7 +305,19 @@ def get_obs_frame(
   ).astype(np.float32)
 
 
-def build_obs_term_major(history: deque[np.ndarray]) -> np.ndarray:
+def gait_phase_features(sim_time: float, command: np.ndarray) -> np.ndarray:
+  """Match the 1-second training clock; zero-command stance uses zero phases."""
+  if np.linalg.norm(command[:2]) + abs(command[2]) <= 1e-6:
+    phase = np.zeros(2)
+  else:
+    phase = (sim_time + np.array([0.0, 0.5])) % 1.0
+  angle = 2.0 * np.pi * phase
+  return np.array([np.sin(angle[0]), np.cos(angle[0]), np.sin(angle[1]), np.cos(angle[1])], dtype=np.float32)
+
+
+def build_obs_term_major(
+  history: deque[np.ndarray], phase: np.ndarray | None = None
+) -> np.ndarray:
   """Concatenate the 4 single frames TERM-major (mjlab 1.4.0 layout)."""
   frames = np.array(list(history))  # (4, 45), oldest -> newest
   parts = []
@@ -313,6 +325,8 @@ def build_obs_term_major(history: deque[np.ndarray]) -> np.ndarray:
   for d in TERM_DIMS:
     parts.append(frames[:, offset:offset + d].reshape(-1))
     offset += d
+  if phase is not None:
+    parts.append(phase)
   return np.concatenate(parts).reshape(1, -1)
 
 
@@ -381,6 +395,8 @@ def run(
   policy = OnnxPolicy(model_path)
   if policy.output_dim != NUM_POLICY_ACTIONS:
     raise RuntimeError(f"Expected {NUM_POLICY_ACTIONS} actions, got {policy.output_dim}")
+  if policy.input_dim not in (180, 184):
+    raise RuntimeError(f"Expected 180 legacy or 184 phase-aware observations, got {policy.input_dim}")
 
   model = build_model()
   data = mujoco.MjData(model)
@@ -439,7 +455,11 @@ def run(
         else:
           history.append(obs_frame)
 
-        obs = build_obs_term_major(history)
+        phase = (
+          gait_phase_features(physics_step * model.opt.timestep, command)
+          if policy.input_dim == 184 else None
+        )
+        obs = build_obs_term_major(history, phase)
         action = policy(obs)
         last_action = action[:NUM_OBS_JOINTS].astype(np.float32)
 

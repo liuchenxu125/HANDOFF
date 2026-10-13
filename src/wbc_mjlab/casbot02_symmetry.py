@@ -5,8 +5,9 @@ The loco actor observation is term-major with four history frames::
   [base_ang_vel(3), projected_gravity(3), command(3),
    joint_pos(12), joint_vel(12), last_action(12)] x 4 = 180
 
-The critic appends four frames of body-frame base linear velocity, for 192
-dimensions in total.  Reflection is about the robot sagittal (x-z) plane.
+The phase-aware teacher appends four current phase features to the actor
+(184 dims), followed by linear velocity history in the critic (196 dims).
+Legacy 180/192-dim observations remain supported. Reflection is about x-z.
 """
 
 from __future__ import annotations
@@ -70,11 +71,12 @@ def _mirror_joint_history(value: torch.Tensor) -> torch.Tensor:
 
 
 def mirror_loco_observation(obs: torch.Tensor) -> torch.Tensor:
-  """Mirror one flattened actor (180-D) or critic (192-D) observation."""
-  if obs.shape[-1] not in (ACTOR_OBS_DIM, CRITIC_OBS_DIM):
+  """Mirror legacy observations or observations with four current phases."""
+  has_phase = obs.shape[-1] in (ACTOR_OBS_DIM + 4, CRITIC_OBS_DIM + 4)
+  if obs.shape[-1] not in (ACTOR_OBS_DIM, CRITIC_OBS_DIM, ACTOR_OBS_DIM + 4, CRITIC_OBS_DIM + 4):
     raise ValueError(
       "Casbot02 loco symmetry expects actor/critic observation dimensions "
-      f"{ACTOR_OBS_DIM}/{CRITIC_OBS_DIM}, got {obs.shape[-1]}"
+      f"180/192 or 184/196, got {obs.shape[-1]}"
     )
 
   mirrored = obs.clone()
@@ -107,7 +109,12 @@ def mirror_loco_observation(obs: torch.Tensor) -> torch.Tensor:
     )
     offset += joint_width
 
-  if obs.shape[-1] == CRITIC_OBS_DIM:
+  if has_phase:
+    # Phase order is sin(left), cos(left), sin(right), cos(right).
+    mirrored[..., offset : offset + 4] = obs[..., offset : offset + 4][..., [2, 3, 0, 1]]
+    offset += 4
+
+  if obs.shape[-1] in (CRITIC_OBS_DIM, CRITIC_OBS_DIM + 4):
     # Privileged body-frame base linear velocity is a polar vector.
     mirrored[..., offset : offset + width] = _mirror_vector_history(
       obs[..., offset : offset + width], (1.0, -1.0, 1.0)

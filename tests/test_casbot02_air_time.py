@@ -30,12 +30,12 @@ class Casbot02AirTimeRewardTest(unittest.TestCase):
       extras={"log": {}},
     )
 
-  def test_config_restores_separate_baseline_terms(self):
+  def test_config_disables_all_air_time_terms(self):
     cfg = casbot02_loco_teacher_env_cfg()
-    self.assertNotIn("air_time", cfg.rewards)
+    self.assertEqual(cfg.rewards["air_time"].weight, 0.0)
     term = cfg.rewards["feet_air_time"]
     self.assertIs(term.func, feet_air_time)
-    self.assertEqual(term.weight, 1.0)
+    self.assertEqual(term.weight, 0.0)
     self.assertEqual(term.params, {
       "sensor_name": "feet_ground_contact",
       "uniform_cmd_name": "twist",
@@ -43,7 +43,7 @@ class Casbot02AirTimeRewardTest(unittest.TestCase):
     })
     term = cfg.rewards["turning_air_time"]
     self.assertIs(term.func, command_conditioned_feet_air_time)
-    self.assertEqual(term.weight, 1.0)
+    self.assertEqual(term.weight, 0.0)
     self.assertEqual(term.params, {
       "sensor_name": "feet_ground_contact",
       "command_name": "twist",

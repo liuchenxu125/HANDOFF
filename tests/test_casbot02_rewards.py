@@ -31,7 +31,7 @@ class Casbot02AnkleActionRateRewardTest(unittest.TestCase):
 
   def test_loco_cfg_uses_baseline_global_action_rate_only(self):
     cfg = casbot02_loco_teacher_env_cfg()
-    self.assertEqual(cfg.rewards["action_rate_l2"].weight, -0.2)
+    self.assertEqual(cfg.rewards["action_rate_l2"].weight, -0.1)
     self.assertNotIn("ankle_action_rate_l2", cfg.rewards)
 
   def test_only_pitch_action_differences_are_penalized(self):
@@ -87,12 +87,10 @@ class Casbot02TorqueEnergyRewardTest(unittest.TestCase):
       list(cfg.rewards["torque_limits"].params["asset_cfg"].actuator_names),
       ["leg_l5_joint", "leg_r5_joint"],
     )
-    # feet_air_time: G1/HANDOFF landing-time reward gated by twist command.
-    # Currently disabled (commented out) in the loco config; when re-enabled,
-    # target=None means reward any lift proportional to air time (no cap).
-    self.assertNotIn("air_time", cfg.rewards)
+    # Air-time terms stay configured for logging but have no contribution.
+    self.assertEqual(cfg.rewards["air_time"].weight, 0.0)
     if "feet_air_time" in cfg.rewards:
-      self.assertGreater(cfg.rewards["feet_air_time"].weight, 0.0)
+      self.assertEqual(cfg.rewards["feet_air_time"].weight, 0.0)
       self.assertIsNone(
         cfg.rewards["feet_air_time"].params["feet_air_time_target"]
       )

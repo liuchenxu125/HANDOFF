@@ -6,8 +6,8 @@ joints), whose observation is aligned EXACTLY with the AMP teacher's actor obs:
     [base_ang_vel(3), projected_gravity(3), command(3),
      joint_pos(12), joint_vel(12), actions(12)]  x 4-frame history  == 180 dims
 
-so the student env can emit one 180-dim vector that both frozen teachers
-consume (see ``rl/two_teacher_blend.py`` for the distillation loss).
+The loco teacher additionally appends the current four gait-phase features
+(184 dims). The student retains the legacy 180-dim dual-teacher layout.
 """
 
 from __future__ import annotations
@@ -37,6 +37,7 @@ from mjlab.utils.noise import UniformNoiseCfg as Unoise
 
 from wbc_mjlab import casbot02_constants as C
 from wbc_mjlab import rewards as wbc_rewards
+from wbc_mjlab import observations as wbc_obs
 from wbc_mjlab.casbot02_actions import Casbot02LegWithArmSwingActionCfg
 from wbc_mjlab.casbot02_commands import Casbot02VelocityCommandCfg
 
@@ -244,75 +245,56 @@ def _apply_flat_terrain(cfg: ManagerBasedRlEnvCfg) -> None:
 def _apply_loco_rewards(cfg: ManagerBasedRlEnvCfg) -> None:
   """Casbot02 velocity-tracking reward stack with G1 foot shaping."""
 
-  # Restore the exact reward set from 2026-09-29_10-44-27.
+  # Global action smoothing; ankle-specific smoothing is disabled.
   cfg.rewards["action_rate_l2"].weight = -0.1
   cfg.rewards.pop("ankle_action_rate_l2", None)
 
-  # Straight translation uses velocity-weighted clearance with no time curve.
-  # In-place turning follows the 2026-09-22 half-sine height/time curve.
-  cfg.rewards.pop("foot_clearance", None)
-  # Hybrid foot-lift reward. Translation uses the G1-style velocity-weighted
-  # clearance (free step length, no time template). Turning switches to the
-  # half-sine time-curve template (fixed swing time + peak) — the rigid gait
-  # in-place turns need. Blended by command_turning_blend, so the time template
-  # only kicks in while turning and never locks straight-walk step length.
-  cfg.rewards["swing_height_curve"] = RewardTermCfg(
-    func=wbc_rewards.command_conditioned_feet_clearance_with_turn_curve,
+  # Match the G1 teacher's velocity-weighted clearance for all motion commands.
+  cfg.rewards.pop("swing_height_curve", None)
+  cfg.rewards["foot_clearance"] = RewardTermCfg(
+    func=velocity_mdp.feet_clearance,
     weight=-6.0,
     params={
       "height_sensor_name": "foot_height_scan",
-      "sensor_name": "feet_ground_contact",
-      "translation_target_height": 0.12,
-      "turning_peak_height": 0.065,
-      "turning_swing_time": 0.40,
-      "turning_weight_scale": 0.5,  # -6 * 0.5 = old turning weight -3.
-      "turning_command_threshold": 0.2,
+      "target_height": 0.09,
       "command_name": "twist",
       "command_threshold": 0.05,
-      "turning_linear_threshold": 0.2,
-      "turning_angular_threshold": 0.2,
       "asset_cfg": _feet_site_asset(),
     },
   )
 
-  # foot_swing_height with a turn split (no time curve): penalize
-  # (peak/target - 1)^2 at first contact. Straight walking targets 12 cm;
-  # pure in-place turns target 7 cm (lower peak, appropriate for lateral steps).
+  # Match G1's landing peak-height penalty without a turning split.
   cfg.rewards["foot_swing_height"] = RewardTermCfg(
-    func=wbc_rewards.command_conditioned_feet_swing_height,
+    func=velocity_mdp.feet_swing_height,
     weight=-0.75,
     params={
       "sensor_name": "feet_ground_contact",
       "height_sensor_name": "foot_height_scan",
-      "translation_target_height": 0.15,
-      "turning_target_height": 0.07,
-      "turning_weight_scale": 1.0 / 3.0,  # -0.75 / 3 = -0.25.
+      "target_height": 0.12,
       "command_name": "twist",
       "command_threshold": 0.05,
-      "turning_linear_threshold": 0.2,
-      "turning_angular_threshold": 0.2,
     },
   )
   cfg.rewards["foot_slip"].weight = -1.0
   cfg.rewards["foot_slip"].params["command_threshold"] = 0.05
   cfg.rewards["foot_slip"].params["asset_cfg"] = _feet_site_asset()
-  cfg.rewards["standing_feet_slip"] = RewardTermCfg(
-    func=wbc_rewards.standing_feet_slip,
-    weight=-2.0,
-    params={
-      "sensor_name": "feet_ground_contact",
-      "command_name": "twist",
-      "command_threshold": 0.05,
-      "asset_cfg": _force_site_asset(),
-    },
-  )
-  cfg.rewards["soft_landing"].weight = -3e-3
+  # cfg.rewards["standing_feet_slip"] = RewardTermCfg(
+  #   func=wbc_rewards.standing_feet_slip,
+  #   weight=-2.0,
+  #   params={
+  #     "sensor_name": "feet_ground_contact",
+  #     "command_name": "twist",
+  #     "command_threshold": 0.05,
+  #     "asset_cfg": _force_site_asset(),
+  #   },
+  # )
+  cfg.rewards["soft_landing"].weight = -1e-4
 
-  # Restore the two separately logged baseline air-time rewards.
-  cfg.rewards.pop("air_time", None)
+  # Disable all air-time contributions; use G1's alternating contact reward.
+  cfg.rewards["air_time"].weight = 0.0
   cfg.rewards["turning_air_time"] = RewardTermCfg(
     func=wbc_rewards.command_conditioned_feet_air_time,
-    weight=1.0,
+    weight=0.0,
     params={
       "sensor_name": "feet_ground_contact",
       "command_name": "twist",
@@ -327,11 +309,23 @@ def _apply_loco_rewards(cfg: ManagerBasedRlEnvCfg) -> None:
   )
   cfg.rewards["feet_air_time"] = RewardTermCfg(
     func=wbc_rewards.feet_air_time,
-    weight=1.0,
+    weight=0.0,
     params={
       "sensor_name": "feet_ground_contact",
       "uniform_cmd_name": "twist",
       "feet_air_time_target": None,
+    },
+  )
+
+  cfg.rewards["gait_phase_contact"] = RewardTermCfg(
+    func=wbc_rewards.gait_phase_contact,
+    weight=0.5,
+    params={
+      "sensor_name": "feet_ground_contact",
+      "command_name": "twist",
+      "gait_period": 1.0,
+      "gait_offset": 0.5,
+      "stance_ratio": 0.55,
     },
   )
 
@@ -389,7 +383,7 @@ def _apply_loco_rewards(cfg: ManagerBasedRlEnvCfg) -> None:
   # intentional: the reward function returns a negative error outside this band.
   cfg.rewards["feet_distance_lateral"] = RewardTermCfg(
     func=wbc_rewards.feet_distance_lateral,
-    weight=1,
+    weight=0.75,
     params={
       "asset_cfg": _feet_site_asset(),
       "min_distance": 0.265,
@@ -398,7 +392,7 @@ def _apply_loco_rewards(cfg: ManagerBasedRlEnvCfg) -> None:
   )
   cfg.rewards["knee_distance_lateral"] = RewardTermCfg(
     func=wbc_rewards.knee_distance_lateral,
-    weight=2.0,
+    weight=1.5,
     params={
       "asset_cfg": _knee_body_asset(),
       "min_distance": 0.265,
@@ -425,9 +419,9 @@ def _apply_loco_rewards(cfg: ManagerBasedRlEnvCfg) -> None:
   #     "asset_cfg": _feet_body_asset(),
   #   },
   # )
-  # cfg.rewards["body_ang_vel"].weight = -0.05
-  # cfg.rewards["body_ang_vel"].params["asset_cfg"] = _torso_asset()
-  # cfg.rewards["angular_momentum"].weight = -0.02
+  cfg.rewards["body_ang_vel"].weight = -0.05
+  cfg.rewards["body_ang_vel"].params["asset_cfg"] = _torso_asset()
+  cfg.rewards["angular_momentum"].weight = -0.02
   # Baseline whole-body momentum-rate penalties (not momentum magnitude).
   cfg.rewards["linear_momentum_change"] = RewardTermCfg(
     func=wbc_rewards.LinearMomentumChangePenalty,
@@ -686,31 +680,49 @@ def _apply_twist_ranges(cfg: ManagerBasedRlEnvCfg) -> None:
   ]
 
 
-def _apply_leg_obs(cfg: ManagerBasedRlEnvCfg, *, play: bool) -> None:
-  """Override actor/critic obs to 12-leg layout (history 4)."""
+def _apply_leg_obs(
+  cfg: ManagerBasedRlEnvCfg, *, play: bool, include_phase: bool = True
+) -> None:
+  """Four-frame proprioception plus optional current gait-phase features."""
   enable_noise = not play
+  actor_terms = _loco_actor_terms(enable_noise=enable_noise)
+  for term in actor_terms.values():
+    term.history_length = 4
+  if include_phase:
+    actor_terms["phase"] = ObservationTermCfg(
+      func=wbc_obs.loco_phase_features,
+      params={"command_name": "twist", "gait_period": 1.0, "gait_offset": 0.5},
+    )
   cfg.observations["actor"] = ObservationGroupCfg(
-    terms=_loco_actor_terms(enable_noise=enable_noise),
+    terms=actor_terms,
     concatenate_terms=True,
     enable_corruption=enable_noise,
-    history_length=4,
+    history_length=None,
   )
   # Critic = actor terms + privileged base_lin_vel (deployment-invisible).
   critic_terms = _loco_actor_terms(enable_noise=False)
+  for term in critic_terms.values():
+    term.history_length = 4
+  if include_phase:
+    critic_terms["phase"] = ObservationTermCfg(
+      func=wbc_obs.loco_phase_features,
+      params={"command_name": "twist", "gait_period": 1.0, "gait_offset": 0.5},
+    )
   critic_terms["base_lin_vel"] = ObservationTermCfg(
     func=env_mdp.builtin_sensor,
     params={"sensor_name": "robot/linear-velocity"},
+    history_length=4,
   )
   cfg.observations["critic"] = ObservationGroupCfg(
     terms=critic_terms,
     concatenate_terms=True,
     enable_corruption=False,
-    history_length=4,
+    history_length=None,
   )
 
 
 def casbot02_loco_teacher_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
-  """12-leg Casbot02 velocity-tracking loco teacher env (obs 180, action 12)."""
+  """12-leg loco teacher with gait phase (actor 184, critic 196, action 12)."""
   cfg = make_velocity_env_cfg()
 
   _apply_casbot02_robot(cfg)
@@ -750,6 +762,7 @@ def casbot02_student_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   ``rl/casbot02_distill.py``).
   """
   cfg = casbot02_loco_teacher_env_cfg(play=play)
+  _apply_leg_obs(cfg, play=play, include_phase=False)
   cfg.observations["command"] = ObservationGroupCfg(
     terms={
       "command": ObservationTermCfg(
