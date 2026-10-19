@@ -64,7 +64,7 @@ class Casbot02AnkleActionRateRewardTest(unittest.TestCase):
 
 
 class Casbot02TorqueEnergyRewardTest(unittest.TestCase):
-  def test_loco_cfg_weights_only_ankle_pitch(self):
+  def test_loco_cfg_limits_all_leg_torques_with_pitch_only_regularizers(self):
     cfg = casbot02_loco_teacher_env_cfg()
     # Legacy normalized-over-limit term is not used; InstinctLab-style terms are.
     self.assertNotIn("joint_torques_l2", cfg.rewards)
@@ -80,12 +80,12 @@ class Casbot02TorqueEnergyRewardTest(unittest.TestCase):
         cfg.rewards["dof_torques_l2"].params["joint_weights"],
         _ANKLE_PITCH_JOINT_WEIGHTS,
       )
-    # torque_limits: ankle pitch only (leg_[lr]5), 0.8 ratio.
+    # torque_limits: all 12 leg actuators, 0.8 ratio.
     self.assertEqual(cfg.rewards["torque_limits"].weight, -0.01)
     self.assertEqual(cfg.rewards["torque_limits"].params["limit_ratio"], 0.8)
     self.assertEqual(
       list(cfg.rewards["torque_limits"].params["asset_cfg"].actuator_names),
-      ["leg_l5_joint", "leg_r5_joint"],
+      list(CASBOT02_LEG_ONLY_JOINT_NAMES),
     )
     # Air-time terms stay configured for logging but have no contribution.
     self.assertEqual(cfg.rewards["air_time"].weight, 0.0)

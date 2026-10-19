@@ -5,9 +5,10 @@ The loco actor observation is term-major with four history frames::
   [base_ang_vel(3), projected_gravity(3), command(3),
    joint_pos(12), joint_vel(12), last_action(12)] x 4 = 180
 
-The phase-aware teacher appends four current phase features to the actor
-(184 dims), followed by linear velocity history in the critic (196 dims).
-Legacy 180/192-dim observations remain supported. Reflection is about x-z.
+The teacher appends four frames of four phase features (actor 196 dims),
+followed by linear velocity history in the critic (208 dims). Legacy
+180/192 and current-phase 184/196 layouts remain supported. Reflection is
+about x-z; the 196-D legacy critic requires an explicit phase history length.
 """
 
 from __future__ import annotations
@@ -70,13 +71,23 @@ def _mirror_joint_history(value: torch.Tensor) -> torch.Tensor:
   return mirror_leg_joints(frames).reshape_as(value)
 
 
-def mirror_loco_observation(obs: torch.Tensor) -> torch.Tensor:
-  """Mirror legacy observations or observations with four current phases."""
-  has_phase = obs.shape[-1] in (ACTOR_OBS_DIM + 4, CRITIC_OBS_DIM + 4)
-  if obs.shape[-1] not in (ACTOR_OBS_DIM, CRITIC_OBS_DIM, ACTOR_OBS_DIM + 4, CRITIC_OBS_DIM + 4):
+def mirror_loco_observation(
+  obs: torch.Tensor, *, phase_history_length: int | None = None
+) -> torch.Tensor:
+  """Mirror phases frame by frame; disambiguate old 196-D critics explicitly."""
+  size = obs.shape[-1]
+  if size in (ACTOR_OBS_DIM, CRITIC_OBS_DIM):
+    phase_width = 0
+  else:
+    if phase_history_length is None:
+      phase_history_length = 0 if size == ACTOR_OBS_DIM + 4 else HISTORY_LENGTH
+    if phase_history_length not in (0, HISTORY_LENGTH):
+      raise ValueError(f"Unsupported phase history length {phase_history_length}")
+    phase_width = 4 * max(1, phase_history_length)
+  if size not in (ACTOR_OBS_DIM + phase_width, CRITIC_OBS_DIM + phase_width):
     raise ValueError(
       "Casbot02 loco symmetry expects actor/critic observation dimensions "
-      f"180/192 or 184/196, got {obs.shape[-1]}"
+      f"180/192, 184/196 or 196/208, got {size} with {phase_width} phase values"
     )
 
   mirrored = obs.clone()
@@ -109,12 +120,17 @@ def mirror_loco_observation(obs: torch.Tensor) -> torch.Tensor:
     )
     offset += joint_width
 
-  if has_phase:
+  if phase_width:
     # Phase order is sin(left), cos(left), sin(right), cos(right).
-    mirrored[..., offset : offset + 4] = obs[..., offset : offset + 4][..., [2, 3, 0, 1]]
-    offset += 4
+    phase = obs[..., offset : offset + phase_width].reshape(
+      *obs.shape[:-1], phase_width // 4, 4
+    )
+    mirrored[..., offset : offset + phase_width] = phase[..., [2, 3, 0, 1]].reshape(
+      *obs.shape[:-1], phase_width
+    )
+    offset += phase_width
 
-  if obs.shape[-1] in (CRITIC_OBS_DIM, CRITIC_OBS_DIM + 4):
+  if size == CRITIC_OBS_DIM + phase_width:
     # Privileged body-frame base linear velocity is a polar vector.
     mirrored[..., offset : offset + width] = _mirror_vector_history(
       obs[..., offset : offset + width], (1.0, -1.0, 1.0)
@@ -135,15 +151,25 @@ def compute_symmetric_states(
   actions: torch.Tensor | None = None,
 ) -> tuple[TensorDict | None, torch.Tensor | None]:
   """Append the sagittally mirrored sample to an RSL-RL mini-batch."""
-  del env  # The fixed Casbot02 layout is validated explicitly above.
-
   obs_aug = None
   if obs is not None:
     batch_size = obs.batch_size[0]
     obs_aug = obs.repeat(2)
     for key, value in obs.items():
       obs_aug[key][:batch_size] = value
-      obs_aug[key][batch_size:] = mirror_loco_observation(value)
+      # The old critic and new actor are both 196-D. Resolve phase history
+      # from the actual observation group rather than relying only on size.
+      group = env.cfg.observations[key]
+      phase_term = group.terms.get("phase")
+      phase_history_length = None
+      if phase_term is not None:
+        phase_history_length = (
+          group.history_length if group.history_length is not None
+          else phase_term.history_length
+        )
+      obs_aug[key][batch_size:] = mirror_loco_observation(
+        value, phase_history_length=phase_history_length
+      )
 
   actions_aug = None
   if actions is not None:

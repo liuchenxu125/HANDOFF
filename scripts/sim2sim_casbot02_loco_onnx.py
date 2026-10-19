@@ -1,11 +1,11 @@
 """Casbot02 12-leg loco teacher sim2sim (ONNX policy, keyboard command).
 
 Same structure as amp_mjlab's ``sim2sim_casbot02_leg_amp_onnx.py``, but:
-  * loads the loco teacher ONNX (12 action, 180 legacy / 184 phase-aware obs);
+  * loads the loco teacher ONNX (12 actions; 180/184 legacy or 196 phase-history obs);
   * builds the observation TERM-major (mjlab 1.4.0 layout: each term's 4-frame
     history contiguous), NOT time-major like the amp (mjlab 1.2.0) script.
 
-Keyboard: Up/Down = vx, Left/Right = yaw-rate, Space = stop.
+Keyboard: Up/Down = vx, A/D = vy, Left/Right = yaw-rate, Space = stop.
 """
 from __future__ import annotations
 
@@ -40,6 +40,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 SIM_TIMESTEP = 0.005
 POLICY_DECIMATION = 4
 HISTORY_LENGTH = 4
+DEFAULT_GAIT_PERIOD = 1.2
 NUM_OBS_JOINTS = len(CASBOT02_LEG_ONLY_JOINT_NAMES)  # 12
 NUM_POLICY_ACTIONS = len(CASBOT02_LEG_ONLY_JOINT_NAMES)  # 12
 NUM_FULL_JOINTS = len(CASBOT02_23DOF_JOINT_NAMES)  # 22 (legs + arms)
@@ -63,7 +64,7 @@ PRINT_EVERY = 1.0  # 终端打印关节位置的时间间隔(秒)
 DEFAULT_LOG_CSV = ""
 DEFAULT_LOG_DECIMATION = 1
 COMMAND_X_RANGE = (-3.5, 5.0)
-COMMAND_Y_RANGE = (-1.0, 1.0)
+COMMAND_Y_RANGE = (-0.5, 0.5)
 COMMAND_YAW_RANGE = (-3.14, 3.14)
 COMMAND_X_STEP = 0.1
 COMMAND_Y_STEP = 0.1
@@ -305,12 +306,14 @@ def get_obs_frame(
   ).astype(np.float32)
 
 
-def gait_phase_features(sim_time: float, command: np.ndarray) -> np.ndarray:
-  """Match the 1-second training clock; zero-command stance uses zero phases."""
+def gait_phase_features(
+  sim_time: float, command: np.ndarray, gait_period: float = DEFAULT_GAIT_PERIOD
+) -> np.ndarray:
+  """Match the training phase clock; zero-command stance uses zero phases."""
   if np.linalg.norm(command[:2]) + abs(command[2]) <= 1e-6:
     phase = np.zeros(2)
   else:
-    phase = (sim_time + np.array([0.0, 0.5])) % 1.0
+    phase = (sim_time / gait_period + np.array([0.0, 0.5])) % 1.0
   angle = 2.0 * np.pi * phase
   return np.array([np.sin(angle[0]), np.cos(angle[0]), np.sin(angle[1]), np.cos(angle[1])], dtype=np.float32)
 
@@ -318,7 +321,7 @@ def gait_phase_features(sim_time: float, command: np.ndarray) -> np.ndarray:
 def build_obs_term_major(
   history: deque[np.ndarray], phase: np.ndarray | None = None
 ) -> np.ndarray:
-  """Concatenate the 4 single frames TERM-major (mjlab 1.4.0 layout)."""
+  """Flatten each term oldest first; phase can be current (4,) or history (4, 4)."""
   frames = np.array(list(history))  # (4, 45), oldest -> newest
   parts = []
   offset = 0
@@ -326,7 +329,7 @@ def build_obs_term_major(
     parts.append(frames[:, offset:offset + d].reshape(-1))
     offset += d
   if phase is not None:
-    parts.append(phase)
+    parts.append(np.asarray(phase).reshape(-1))
   return np.concatenate(parts).reshape(1, -1)
 
 
@@ -336,7 +339,10 @@ def install_command_controls(viewer, command: np.ndarray) -> None:
   def clamp(v, lo, hi):
     return float(np.clip(v, lo, hi))
 
-  keys = {glfw.KEY_UP, glfw.KEY_DOWN, glfw.KEY_LEFT, glfw.KEY_RIGHT, glfw.KEY_SPACE}
+  keys = {
+    glfw.KEY_UP, glfw.KEY_DOWN, glfw.KEY_A, glfw.KEY_D,
+    glfw.KEY_LEFT, glfw.KEY_RIGHT, glfw.KEY_SPACE,
+  }
   orig = viewer._key_callback
 
   def cb(window, key, scancode, action, mods):
@@ -345,6 +351,10 @@ def install_command_controls(viewer, command: np.ndarray) -> None:
         command[0] = clamp(command[0] + COMMAND_X_STEP, *COMMAND_X_RANGE)
       elif key == glfw.KEY_DOWN:
         command[0] = clamp(command[0] - COMMAND_X_STEP, *COMMAND_X_RANGE)
+      elif key == glfw.KEY_A:
+        command[1] = clamp(command[1] + COMMAND_Y_STEP, *COMMAND_Y_RANGE)
+      elif key == glfw.KEY_D:
+        command[1] = clamp(command[1] - COMMAND_Y_STEP, *COMMAND_Y_RANGE)
       elif key == glfw.KEY_LEFT:
         command[2] = clamp(command[2] + COMMAND_YAW_STEP, *COMMAND_YAW_RANGE)
       elif key == glfw.KEY_RIGHT:
@@ -368,12 +378,14 @@ def install_command_controls(viewer, command: np.ndarray) -> None:
     viewer._overlay[gridpos][0] += (
       "Command vx/vy/yaw\n"
       "Up/Down forward\n"
+      "A/D lateral\n"
       "Left/Right yaw\n"
       "Space stop\n"
     )
     viewer._overlay[gridpos][1] += (
       f"{command[0]:+.2f}  {command[1]:+.2f}  {command[2]:+.2f}\n"
       f"+/- {COMMAND_X_STEP:.1f} m/s\n"
+      f"+/- {COMMAND_Y_STEP:.1f} m/s\n"
       f"+/- {COMMAND_YAW_STEP:.1f} rad/s\n"
       "zero command\n"
     )
@@ -385,7 +397,10 @@ def run(
   model_arg: str = "",
   log_csv: str = DEFAULT_LOG_CSV,
   log_decimation: int = DEFAULT_LOG_DECIMATION,
+  gait_period: float = DEFAULT_GAIT_PERIOD,
 ) -> None:
+  if not np.isfinite(gait_period) or gait_period <= 0.0:
+    raise ValueError("gait_period must be finite and positive")
   model_path = Path(model_arg) if model_arg else find_latest_onnx()
   if not model_path.is_absolute():
     model_path = REPO_ROOT / model_path
@@ -395,8 +410,10 @@ def run(
   policy = OnnxPolicy(model_path)
   if policy.output_dim != NUM_POLICY_ACTIONS:
     raise RuntimeError(f"Expected {NUM_POLICY_ACTIONS} actions, got {policy.output_dim}")
-  if policy.input_dim not in (180, 184):
-    raise RuntimeError(f"Expected 180 legacy or 184 phase-aware observations, got {policy.input_dim}")
+  if policy.input_dim not in (180, 184, 196):
+    raise RuntimeError(
+      f"Expected 180/184 legacy or 196 phase-history observations, got {policy.input_dim}"
+    )
 
   model = build_model()
   data = mujoco.MjData(model)
@@ -415,6 +432,7 @@ def run(
   mujoco.mj_forward(model, data)
 
   history: deque[np.ndarray] = deque(maxlen=HISTORY_LENGTH)
+  phase_history: deque[np.ndarray] = deque(maxlen=HISTORY_LENGTH)
   last_action = np.zeros(NUM_OBS_JOINTS, dtype=np.float32)
   target_pos = default_joint_pos.copy()
 
@@ -425,7 +443,7 @@ def run(
   viewer.cam.elevation = -20.0
   install_command_controls(viewer, command)
 
-  print("[sim2sim] Up/Down=vx  Left/Right=yaw  Space=stop")
+  print("[sim2sim] Up/Down=vx  A/D=vy  Left/Right=yaw  Space=stop")
   next_time = time.perf_counter()
   sim_time = 0.0
   physics_step = 0
@@ -456,9 +474,15 @@ def run(
           history.append(obs_frame)
 
         phase = (
-          gait_phase_features(physics_step * model.opt.timestep, command)
-          if policy.input_dim == 184 else None
+          gait_phase_features(physics_step * model.opt.timestep, command, gait_period)
+          if policy.input_dim in (184, 196) else None
         )
+        if policy.input_dim == 196:
+          if not phase_history:
+            phase_history.extend([phase] * HISTORY_LENGTH)
+          else:
+            phase_history.append(phase)
+          phase = np.asarray(phase_history)
         obs = build_obs_term_major(history, phase)
         action = policy(obs)
         last_action = action[:NUM_OBS_JOINTS].astype(np.float32)
@@ -501,7 +525,7 @@ def run(
           f"{name}={actual_qpos[i]:+.4f}"
           for i, name in enumerate(CASBOT02_23DOF_JOINT_NAMES)
         )
-        print(f"t={sim_time:7.2f}s base_z={data.qpos[2]:.3f} command=({command[0]:+.2f},{command[2]:+.2f})")
+        print(f"t={sim_time:7.2f}s base_z={data.qpos[2]:.3f} command=({command[0]:+.2f},{command[1]:+.2f},{command[2]:+.2f})")
         print(f"    joint_pos(rad): {jp_str}")
 
       if DEFAULT_REALTIME:
@@ -521,6 +545,12 @@ def run(
 def parse_args() -> argparse.Namespace:
   p = argparse.ArgumentParser(description="Casbot02 loco teacher sim2sim")
   p.add_argument("model_path", nargs="?", default="", help="ONNX path (empty = latest)")
+  p.add_argument(
+    "--gait-period",
+    type=float,
+    default=DEFAULT_GAIT_PERIOD,
+    help="Training gait period in seconds (default: 4/3; use 1.0 for older policies).",
+  )
   p.add_argument(
     "--log-csv",
     nargs="?",
@@ -543,4 +573,4 @@ def parse_args() -> argparse.Namespace:
 
 if __name__ == "__main__":
   args = parse_args()
-  run(args.model_path, args.log_csv, args.log_decimation)
+  run(args.model_path, args.log_csv, args.log_decimation, args.gait_period)

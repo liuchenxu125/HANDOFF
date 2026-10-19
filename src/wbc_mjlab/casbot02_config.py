@@ -6,8 +6,8 @@ joints), whose observation is aligned EXACTLY with the AMP teacher's actor obs:
     [base_ang_vel(3), projected_gravity(3), command(3),
      joint_pos(12), joint_vel(12), actions(12)]  x 4-frame history  == 180 dims
 
-The loco teacher additionally appends the current four gait-phase features
-(184 dims). The student retains the legacy 180-dim dual-teacher layout.
+The loco teacher additionally appends four frames of gait-phase features
+(196 dims). The student retains the legacy 180-dim dual-teacher layout.
 """
 
 from __future__ import annotations
@@ -255,7 +255,7 @@ def _apply_loco_rewards(cfg: ManagerBasedRlEnvCfg) -> None:
     weight=-6.0,
     params={
       "height_sensor_name": "foot_height_scan",
-      "target_height": 0.09,
+      "target_height": 0.07,
       "command_name": "twist",
       "command_threshold": 0.05,
       "asset_cfg": _feet_site_asset(),
@@ -269,12 +269,12 @@ def _apply_loco_rewards(cfg: ManagerBasedRlEnvCfg) -> None:
     params={
       "sensor_name": "feet_ground_contact",
       "height_sensor_name": "foot_height_scan",
-      "target_height": 0.12,
+      "target_height": 0.10,
       "command_name": "twist",
       "command_threshold": 0.05,
     },
   )
-  cfg.rewards["foot_slip"].weight = -1.0
+  cfg.rewards["foot_slip"].weight = -0.3
   cfg.rewards["foot_slip"].params["command_threshold"] = 0.05
   cfg.rewards["foot_slip"].params["asset_cfg"] = _feet_site_asset()
   # cfg.rewards["standing_feet_slip"] = RewardTermCfg(
@@ -287,7 +287,7 @@ def _apply_loco_rewards(cfg: ManagerBasedRlEnvCfg) -> None:
   #     "asset_cfg": _force_site_asset(),
   #   },
   # )
-  cfg.rewards["soft_landing"].weight = -1e-4
+  cfg.rewards["soft_landing"].weight = -6e-4
 
   # Disable all air-time contributions; use G1's alternating contact reward.
   cfg.rewards["air_time"].weight = 0.0
@@ -318,13 +318,13 @@ def _apply_loco_rewards(cfg: ManagerBasedRlEnvCfg) -> None:
 
   cfg.rewards["gait_phase_contact"] = RewardTermCfg(
     func=wbc_rewards.gait_phase_contact,
-    weight=0.5,
+    weight=1.0,
     params={
       "sensor_name": "feet_ground_contact",
       "command_name": "twist",
-      "gait_period": 1.0,
+      "gait_period": 1.2,  # 0.600 s stance + 0.600 s swing.
       "gait_offset": 0.5,
-      "stance_ratio": 0.55,
+      "stance_ratio": 0.5,
     },
   )
 
@@ -360,7 +360,7 @@ def _apply_loco_rewards(cfg: ManagerBasedRlEnvCfg) -> None:
   # 12 policy-controlled leg joints (the arms follow the deterministic swing).
   cfg.rewards["stand_pose"] = RewardTermCfg(
     func=wbc_rewards.stand_pose,
-    weight=-5.0,
+    weight=-3.0,
     params={
       "command_name": "twist",
       "asset_cfg": _leg_asset(),
@@ -382,19 +382,19 @@ def _apply_loco_rewards(cfg: ManagerBasedRlEnvCfg) -> None:
   # intentional: the reward function returns a negative error outside this band.
   cfg.rewards["feet_distance_lateral"] = RewardTermCfg(
     func=wbc_rewards.feet_distance_lateral,
-    weight=0.75,
+    weight=1,
     params={
       "asset_cfg": _feet_site_asset(),
-      "min_distance": 0.265,
+      "min_distance": 0.255,
       "max_distance": 0.42,
     },
   )
   cfg.rewards["knee_distance_lateral"] = RewardTermCfg(
     func=wbc_rewards.knee_distance_lateral,
-    weight=1.5,
+    weight=2,
     params={
       "asset_cfg": _knee_body_asset(),
-      "min_distance": 0.265,
+      "min_distance": 0.255,
       "max_distance": 0.42,
     },
   )
@@ -418,7 +418,7 @@ def _apply_loco_rewards(cfg: ManagerBasedRlEnvCfg) -> None:
   #     "asset_cfg": _feet_body_asset(),
   #   },
   # )
-  cfg.rewards["body_ang_vel"].weight = -0.05
+  cfg.rewards["body_ang_vel"].weight = -0.1
   cfg.rewards["body_ang_vel"].params["asset_cfg"] = _torso_asset()
   cfg.rewards["angular_momentum"].weight = -0.02
   # Baseline whole-body momentum-rate penalties (not momentum magnitude).
@@ -472,7 +472,7 @@ def _apply_loco_rewards(cfg: ManagerBasedRlEnvCfg) -> None:
   # InstinctLab parkour torque terms, ported to mjlab.
   # dof_torques_l2: τ² penalty restricted to ankle pitch (leg_[lr]5). Roll peaks
   #   stay well inside the 80 Nm clamp in sim2sim, so only pitch is penalized.
-  # torque_limits: (|τ| - 0.8·τ_max)²_+ over ankle pitch only (leg_[lr]5).
+  # torque_limits: (|τ| - 0.8·τ_max)²_+ over all 12 leg actuators.
   # cfg.rewards["dof_torques_l2"] = RewardTermCfg(
   #   func=wbc_rewards.joint_torques_l2,
   #   weight=-3e-6,
@@ -485,9 +485,7 @@ def _apply_loco_rewards(cfg: ManagerBasedRlEnvCfg) -> None:
     func=wbc_rewards.applied_torque_limits_by_ratio,
     weight=-0.01,
     params={
-      "asset_cfg": SceneEntityCfg(
-        "robot", actuator_names=["leg_l5_joint", "leg_r5_joint"]
-      ),
+      "asset_cfg": _leg_actuator_asset(),
       "limit_ratio": 0.8,
     },
   )
@@ -533,7 +531,7 @@ def _apply_loco_rewards(cfg: ManagerBasedRlEnvCfg) -> None:
 def _apply_casbot02_dr(cfg: ManagerBasedRlEnvCfg) -> None:
   """Casbot02 域随机化, 对齐 amp_mjlab(补足 make_velocity_env_cfg 里空转的项)."""
   # 1. foot_friction: only randomize the two foot collision geoms.
-  cfg.events["foot_friction"].params["ranges"] = (0.2, 1.3)
+  cfg.events["foot_friction"].params["ranges"] = (0.3, 1.2)
   cfg.events["foot_friction"].params["asset_cfg"] = SceneEntityCfg(
     "robot", geom_names=C.CASBOT02_FOOT_GEOM_NAMES, preserve_order=True
   )
@@ -618,10 +616,10 @@ def _apply_casbot02_dr(cfg: ManagerBasedRlEnvCfg) -> None:
 
 
 def _apply_twist_ranges(cfg: ManagerBasedRlEnvCfg) -> None:
-  """G1's independent command-mode sampling with Casbot02's speed curriculum."""
+  """G1 sampling with a fixed backward limit and no lateral commands."""
   base_twist_cmd = cfg.commands["twist"]
   assert isinstance(base_twist_cmd, UniformVelocityCommandCfg)
-  vx, vy, wz = (-1.0, 1.0), (0.0, 0.0), (-1.0, 1.0)
+  vx, vy, wz = (-0.5, 1.0), (0.0, 0.0), (-1.0, 1.0)
   twist_cmd = UniformVelocityCommandCfg(
     resampling_time_range=base_twist_cmd.resampling_time_range,
     debug_vis=base_twist_cmd.debug_vis,
@@ -643,29 +641,17 @@ def _apply_twist_ranges(cfg: ManagerBasedRlEnvCfg) -> None:
   )
   cfg.commands["twist"] = twist_cmd
 
-  # Expand only the translation range in four stages.  The existing wz
-  # schedule (half range until 5000 iterations, then full range) is unchanged.
+  # Expand forward speed and yaw rate at 5000 iterations (24 steps each).
+  # Keep the backward limit at -0.5 m/s and vy at zero throughout training.
   cfg.curriculum["command_vel"].params["velocity_stages"] = [
     {
       "step": 0,
-      "lin_vel_x": (-0.30, 0.30),
-      "lin_vel_y": vy,
-      "ang_vel_z": (wz[0] * 0.5, wz[1] * 0.5),
-    },
-    {
-      "step": 2500 * 24,
-      "lin_vel_x": (-0.50, 0.50),
+      "lin_vel_x": (vx[0], vx[1] * 0.5),
       "lin_vel_y": vy,
       "ang_vel_z": (wz[0] * 0.5, wz[1] * 0.5),
     },
     {
       "step": 5000 * 24,
-      "lin_vel_x": (-0.80, 0.80),
-      "lin_vel_y": vy,
-      "ang_vel_z": wz,
-    },
-    {
-      "step": 8000 * 24,
       "lin_vel_x": vx,
       "lin_vel_y": vy,
       "ang_vel_z": wz,
@@ -676,7 +662,7 @@ def _apply_twist_ranges(cfg: ManagerBasedRlEnvCfg) -> None:
 def _apply_leg_obs(
   cfg: ManagerBasedRlEnvCfg, *, play: bool, include_phase: bool = True
 ) -> None:
-  """Four-frame proprioception plus optional current gait-phase features."""
+  """Four-frame proprioception and optional four-frame gait-phase history."""
   enable_noise = not play
   actor_terms = _loco_actor_terms(enable_noise=enable_noise)
   for term in actor_terms.values():
@@ -684,7 +670,8 @@ def _apply_leg_obs(
   if include_phase:
     actor_terms["phase"] = ObservationTermCfg(
       func=wbc_obs.loco_phase_features,
-      params={"command_name": "twist", "gait_period": 1.0, "gait_offset": 0.5},
+      params={"command_name": "twist", "gait_period": 1.2, "gait_offset": 0.5},
+      history_length=4,
     )
   cfg.observations["actor"] = ObservationGroupCfg(
     terms=actor_terms,
@@ -699,7 +686,8 @@ def _apply_leg_obs(
   if include_phase:
     critic_terms["phase"] = ObservationTermCfg(
       func=wbc_obs.loco_phase_features,
-      params={"command_name": "twist", "gait_period": 1.0, "gait_offset": 0.5},
+      params={"command_name": "twist", "gait_period": 1.2, "gait_offset": 0.5},
+      history_length=4,
     )
   critic_terms["base_lin_vel"] = ObservationTermCfg(
     func=env_mdp.builtin_sensor,
@@ -715,7 +703,7 @@ def _apply_leg_obs(
 
 
 def casbot02_loco_teacher_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
-  """12-leg loco teacher with gait phase (actor 184, critic 196, action 12)."""
+  """12-leg loco teacher with phase history (actor 196, critic 208, action 12)."""
   cfg = make_velocity_env_cfg()
 
   _apply_casbot02_robot(cfg)

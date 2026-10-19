@@ -140,7 +140,7 @@ class StartupCommandTest(unittest.TestCase):
 
 
 class G1CommandAllocationTest(unittest.TestCase):
-  def test_active_sampler_matches_g1_and_preserves_speed_curriculum(self):
+  def test_active_sampler_matches_g1_with_backward_limit_and_no_lateral_commands(self):
     cfg = casbot02_loco_teacher_env_cfg()
     command = cfg.commands['twist']
     self.assertIs(type(command), UniformVelocityCommandCfg)
@@ -150,9 +150,12 @@ class G1CommandAllocationTest(unittest.TestCase):
     self.assertEqual(command.rel_world_envs, 0.)
     self.assertEqual(command.init_velocity_prob, 0.)
     self.assertEqual(command.resampling_time_range, (3., 8.))
+    self.assertEqual(command.ranges.lin_vel_x, (-.5, 1.))
     self.assertEqual(command.ranges.lin_vel_y, (0., 0.))
     stages = cfg.curriculum['command_vel'].params['velocity_stages']
-    self.assertEqual([stage['step'] for stage in stages], [0, 60000, 120000, 192000])
+    self.assertEqual([stage['step'] for stage in stages], [0, 120000])
+    self.assertEqual([stage['lin_vel_x'] for stage in stages], [(-.5, .5), (-.5, 1.)])
+    self.assertTrue(all(stage['lin_vel_y'] == (0., 0.) for stage in stages))
 
   def test_native_sampling_has_independent_overlapping_modes(self):
     torch.manual_seed(42)
