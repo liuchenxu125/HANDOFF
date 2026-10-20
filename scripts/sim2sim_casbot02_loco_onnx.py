@@ -18,7 +18,7 @@ import time
 import mujoco
 import numpy as np
 
-from mjlab.entity import Entity
+from mjlab.entity import Entity, EntityCfg
 
 from wbc_mjlab.casbot02_constants import (
   CASBOT02_23DOF_JOINT_NAMES,
@@ -71,8 +71,8 @@ COMMAND_Y_STEP = 0.1
 COMMAND_YAW_STEP = 0.1
 
 
-def find_latest_onnx() -> Path:
-  export_root = REPO_ROOT / "logs" / "rsl_rl" / "casbot02_loco_teacher"
+def find_latest_onnx(experiment_name: str = "casbot02_loco_teacher") -> Path:
+  export_root = REPO_ROOT / "logs" / "rsl_rl" / experiment_name
   for run_dir in sorted(export_root.iterdir(), reverse=True):
     onnx_files = list(run_dir.glob("*.onnx"))
     if onnx_files:
@@ -80,8 +80,8 @@ def find_latest_onnx() -> Path:
   raise FileNotFoundError(f"No loco teacher ONNX under {export_root}")
 
 
-def make_default_joint_pos() -> np.ndarray:
-  joint_pos = HOME_KEYFRAME.joint_pos or {}
+def make_default_joint_pos(robot_cfg: EntityCfg | None = None) -> np.ndarray:
+  joint_pos = (robot_cfg.init_state if robot_cfg is not None else HOME_KEYFRAME).joint_pos or {}
   fallback = float(joint_pos.get(".*", 0.0))
   return np.array(
     [float(joint_pos.get(n, fallback)) for n in CASBOT02_23DOF_JOINT_NAMES],
@@ -94,6 +94,13 @@ def make_action_scale() -> np.ndarray:
     [CASBOT02_LEG_ONLY_ACTION_SCALE[n] for n in CASBOT02_LEG_ONLY_JOINT_NAMES],
     dtype=np.float64,
   )
+
+
+def apply_arm_targets(data, target_pos, default_joint_pos, gain: float = ARM_SWING_GAIN) -> None:
+  """Same default-pose holding for both models; zero gain disables knee swing."""
+  knee_diff = data.qpos[7 + LEG_KNEE_L] - data.qpos[7 + LEG_KNEE_R] if gain else 0.0
+  target_pos[ARM_SHOULDER_L] = default_joint_pos[ARM_SHOULDER_L] + gain * knee_diff
+  target_pos[ARM_SHOULDER_R] = default_joint_pos[ARM_SHOULDER_R] - gain * knee_diff
 
 
 def resolve_csv_path(log_csv: str, model_path: Path) -> Path | None:
@@ -277,8 +284,8 @@ class OnnxPolicy:
     ).reshape(-1)
 
 
-def build_model() -> mujoco.MjModel:
-  entity = Entity(get_casbot02_23dof_robot_cfg())
+def build_model(robot_cfg: EntityCfg | None = None) -> mujoco.MjModel:
+  entity = Entity(robot_cfg if robot_cfg is not None else get_casbot02_23dof_robot_cfg())
   spec = entity.spec
   ground = spec.worldbody.add_geom(name="ground", type=mujoco.mjtGeom.mjGEOM_PLANE)
   ground.size = [0.0, 0.0, 1.0]
@@ -398,6 +405,10 @@ def run(
   log_csv: str = DEFAULT_LOG_CSV,
   log_decimation: int = DEFAULT_LOG_DECIMATION,
   gait_period: float = DEFAULT_GAIT_PERIOD,
+  *,
+  robot_cfg: EntityCfg | None = None,
+  action_scale: np.ndarray | None = None,
+  arm_swing_gain: float = ARM_SWING_GAIN,
 ) -> None:
   if not np.isfinite(gait_period) or gait_period <= 0.0:
     raise ValueError("gait_period must be finite and positive")
@@ -415,17 +426,17 @@ def run(
       f"Expected 180/184 legacy or 196 phase-history observations, got {policy.input_dim}"
     )
 
-  model = build_model()
+  model = build_model(robot_cfg)
   data = mujoco.MjData(model)
-  default_joint_pos = make_default_joint_pos()
+  default_joint_pos = make_default_joint_pos(robot_cfg)
   default_obs_joint_pos = default_joint_pos[OBS_JOINT_INDICES]
-  action_scale = make_action_scale()
+  action_scale = make_action_scale() if action_scale is None else np.asarray(action_scale)
   ctrl_lo, ctrl_hi = model.actuator_ctrlrange[:, 0].copy(), model.actuator_ctrlrange[:, 1].copy()
   command = np.array(DEFAULT_COMMAND, dtype=np.float64)
 
   # 默认站姿初始化
   mujoco.mj_resetData(model, data)
-  data.qpos[0:3] = np.asarray(HOME_KEYFRAME.pos, dtype=np.float64)
+  data.qpos[0:3] = np.asarray((robot_cfg.init_state if robot_cfg is not None else HOME_KEYFRAME).pos, dtype=np.float64)
   data.qpos[3:7] = [1.0, 0.0, 0.0, 0.0]
   data.qpos[7:] = default_joint_pos
   data.qvel[:] = 0.0
@@ -493,13 +504,7 @@ def run(
         )
 
       # 训练端 action term 在每个物理子步重新计算肩关节目标。
-      knee_diff = data.qpos[7 + LEG_KNEE_L] - data.qpos[7 + LEG_KNEE_R]
-      target_pos[ARM_SHOULDER_L] = (
-        ARM_SWING_GAIN * knee_diff + default_joint_pos[ARM_SHOULDER_L]
-      )
-      target_pos[ARM_SHOULDER_R] = (
-        -ARM_SWING_GAIN * knee_diff + default_joint_pos[ARM_SHOULDER_R]
-      )
+      apply_arm_targets(data, target_pos, default_joint_pos, arm_swing_gain)
       target_pos = np.clip(target_pos, ctrl_lo, ctrl_hi)
 
       data.ctrl[:] = target_pos

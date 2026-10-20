@@ -37,6 +37,10 @@ from wbc_mjlab.casbot02_rl_cfg import (
   casbot02_loco_teacher_runner_cfg,
   casbot02_student_runner_cfg,
 )
+from wbc_mjlab.casbot02_guitar import (
+  casbot02_guitar_loco_teacher_env_cfg,
+  casbot02_guitar_loco_teacher_runner_cfg,
+)
 from wbc_mjlab.casbot02ampj import (
   casbot02_ampj_getup_teacher_flat_env_cfg,
   casbot02_ampj_getup_teacher_flat_runner_cfg,
@@ -107,6 +111,16 @@ register_mjlab_task(
   env_cfg=casbot02_student_env_cfg(play=False),
   play_env_cfg=casbot02_student_env_cfg(play=True),
   rl_cfg=casbot02_student_runner_cfg(),
+  runner_cls=MjlabOnPolicyRunner,
+)
+
+
+# Independent rigid-guitar variant; all locomotion/PPO settings inherit Casbot02.
+register_mjlab_task(
+  task_id="Casbot02-Guitar-Loco-Teacher-Flat",
+  env_cfg=casbot02_guitar_loco_teacher_env_cfg(play=False),
+  play_env_cfg=casbot02_guitar_loco_teacher_env_cfg(play=True),
+  rl_cfg=casbot02_guitar_loco_teacher_runner_cfg(),
   runner_cls=MjlabOnPolicyRunner,
 )
 
